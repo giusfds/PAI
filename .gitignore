@@ -209,6 +209,13 @@ tempCodeRunnerFile.py
 # PyPI configuration file
 .pypirc
 
+# Projeto PAI
+Dataset/
+models/
+outputs/
+*.pt
+*.pth
+
 # Marimo
 marimo/_static/
 marimo/_lsp/
