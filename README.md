@@ -1,4 +1,4 @@
-# PAI - Segmentacao e classificacao mamografica
+# PAI - Segmentação e Classificação Mamográfica
 
 Projeto inicial para o trabalho pratico de Processamento e Analise de Imagens.
 
@@ -6,10 +6,7 @@ Projeto inicial para o trabalho pratico de Processamento e Analise de Imagens.
 
 As imagens estão disponíveis em:
 
-- [LCC](https://www.dropbox.com/scl/fi/sn225aaabb3k8dwmr368v/LCC.zip?rlkey=ldjmuou1bivxhqo7crt4wls8j&st=5udijp0k&dl=0)
-- [LMLO](https://www.dropbox.com/scl/fi/yrd803iq7c2mfyt9x28tq/LMLO.zip?rlkey=dhtw3qvac492s6idye3r5b69u&st=2f3x8fa7&dl=0)
 - [RCC](https://www.dropbox.com/scl/fi/lnt4g69bz9iedi7b43uxg/RCC.zip?rlkey=mg7wmpucj9yz3kg084keal702&st=jgqevx3u&dl=0)
-- [RMLO](https://www.dropbox.com/scl/fi/yu5ntcjcis2qbwhw)
 
 ## Pré-Requisitos e Configuração de Ambiente
 
@@ -52,21 +49,21 @@ As imagens estão disponíveis em:
 
 ## Arquitetura
 
-- `main.py`: aplicacao grafica Tkinter em arquivo unico, conforme o enunciado.
-- `Dataset/RCC`: base local com classes `D`, `E`, `F`, `G` na vista `right + CC`.
+- `main.py`: aplicação gráfica Tkinter em arquivo unico, conforme o enunciado.
+- `dataset/RCC`: base local com classes `D`, `E`, `F`, `G` na vista `right + CC`.
 - `models/`: pesos treinados gerados localmente, ignorados pelo Git.
 - `outputs/`: espaco para resultados, figuras e logs gerados localmente.
 
 Dentro de `main.py`, o codigo esta separado em blocos:
 
-- descoberta do dataset e regra de treino/teste por numeracao multipla de 4;
-- leitura PNG/TIFF e normalizacao de imagens 8/16 bits;
-- segmentacao automatica por limiar de Otsu, morfologia e maior componente;
+- descoberta do dataset e regra de treino/teste por numeração multipla de 4;
+- leitura PNG/TIFF e normalização de imagens 8/16 bits;
+- segmentação automatica por limiar de Otsu, morfologia e maior componente;
 - data augmentation por rotacoes `-20`, `-10`, `0`, `10`, `20`;
-- classificacao binaria e de 4 classes com ResNet-18 e EfficientNet-B0;
-- metricas exigidas no enunciado;
+- classificação binaria e de 4 classes com ResNet-18 e EfficientNet-B0;
+- métricas exigidas no enunciado;
 - Grad-CAM;
-- interface grafica com visualizacao, zoom, treino, teste e classificacao.
+- interface gráfica com visualização, zoom, treino, teste e classificação.
 
 ## Como Executar
 
