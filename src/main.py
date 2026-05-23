@@ -58,7 +58,7 @@ except ImportError:  # pragma: no cover
 # CONSTANTES E CONFIG's
 # ============================================================================
 
-DATASET_FILEPATH: str = "dataset/RCC"
+DATASET_FILEPATH: str = "dataset"
 MODEL_FILEPATH: str = "models"
 
 IMAGE_EXTENSIONS: set[str] = {".png", ".tif", ".tiff"}
@@ -365,10 +365,12 @@ class DatasetManager:
             stripped = part.strip()
             if not stripped:
                 continue
-            class_name = stripped[0].upper()
-            if class_name not in CLASS_TO_INDEX:
-                continue
-            return class_name
+            upper = stripped.upper()
+            if upper in CLASS_TO_INDEX:
+                return upper
+            class_name = upper[0]
+            if class_name in CLASS_TO_INDEX and len(stripped) > 1 and stripped[1] in {" ", "+", "-", "_"}:
+                return class_name
         return None
 
     @staticmethod
@@ -964,7 +966,7 @@ class MammographyApp(tk.Tk):
     def ensure_records(self) -> bool:
         """Verifica se há dataset carregado."""
         if not self.records:
-            messagebox.showinfo("Dataset", "Selecione o diretorio Dataset/RCC antes.")
+            messagebox.showinfo("Dataset", f"Selecione o diretorio do dataset antes. Atual: {self.dataset_dir}")
             return False
         return True
 
