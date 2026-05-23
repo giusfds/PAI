@@ -49,12 +49,12 @@ As imagens estão disponíveis em:
 
 ## Arquitetura
 
-- `main.py`: aplicação gráfica Tkinter em arquivo unico, conforme o enunciado.
+- `src/main.py`: aplicação gráfica Tkinter em arquivo unico, conforme o enunciado.
 - `dataset/RCC`: base local com classes `D`, `E`, `F`, `G` na vista `right + CC`.
 - `models/`: pesos treinados gerados localmente, ignorados pelo Git.
 - `outputs/`: espaco para resultados, figuras e logs gerados localmente.
 
-Dentro de `main.py`, o codigo esta separado em blocos:
+Dentro de `src/main.py`, o codigo esta separado em blocos:
 
 - descoberta do dataset e regra de treino/teste por numeração multipla de 4;
 - leitura PNG/TIFF e normalização de imagens 8/16 bits;
@@ -76,12 +76,12 @@ Dentro de `main.py`, o codigo esta separado em blocos:
     ```
 
 3. Prepare os datasets: 
-    - Baixe e extraia os arquivos nas pastas indicadas no projeto (veja seção "Datasets"). Garanta que a estrutura esteja em `Dataset/` conforme esperado pelo `main.py`.
+    - Baixe e extraia os arquivos nas pastas indicadas no projeto (veja seção "Datasets"). Garanta que a estrutura esteja em `dataset/` conforme esperado pelo `src/main.py`.
 
 4. Execute a aplicação:
 
     ```
-    python main.py
+    python src/main.py
     ```
 
 - Na primeira execução o PyTorch pode baixar pesos pré-treinados (internet necessária).
@@ -91,5 +91,5 @@ Dica: se encontrar erros relacionados a versões do PyTorch/CUDA, verifique a ve
 
 ## Observacoes de entrega
 
-Antes de entregar, preencha no topo de `main.py` os nomes, matriculas, curso e campus dos
+Antes de entregar, preencha no topo de `src/main.py` os nomes, matriculas, curso e campus dos
 integrantes. Nao inclua `Dataset/`, `models/` ou `outputs/` no ZIP final.

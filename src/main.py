@@ -17,6 +17,7 @@ import queue
 import re
 import threading
 import time
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -72,6 +73,10 @@ BIRADS_LABELS: dict[str, str] = {
 ROTATION_ANGLES: list[int] = [-20, -10, 0, 10, 20]
 DEFAULT_DATASET_DIR: Path = Path(DATASET_FILEPATH)
 MODEL_DIR: Path = Path(MODEL_FILEPATH)
+MODEL_DIR.mkdir(exist_ok=True, parents=True)
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+LOGGER = logging.getLogger("pai")
 
 # Constantes para evitar números mágicos
 IMAGE_DEFAULT_SIZE: int = 224
@@ -140,6 +145,18 @@ class ImageRecord:
     def binary_index(self) -> int:
         return 0 if self.class_name in {"D", "E"} else 1
 
+    @property
+    def display_name(self) -> str:
+        label = BIRADS_LABELS.get(self.class_name, self.class_name)
+        return f"{self.path.name} | {self.class_name} ({label}) | {self.split}"
+
+    def label_index(self, task: str) -> int:
+        if task == "binary":
+            return self.binary_index
+        if task == "four":
+            return self.class_index
+        raise ValueError(f"Tarefa desconhecida: {task}")
+
 
 # ============================================================================
 # IMAGE_PROCESSOR
@@ -166,6 +183,7 @@ class ImageProcessor:
         if image.mode not in {"L", "I;16", "I", "F"}:
             image = image.convert("L")
         array = np.asarray(image).astype(np.float32)
+        image_obj.bit_depth = ImageProcessor._bit_depth(image, array)
         max_value = float(np.max(array)) if array.size else 1.0
         if max_value > 0:
             array /= max_value
@@ -174,6 +192,18 @@ class ImageProcessor:
         image_obj.width = image.width
         image_obj.height = image.height
         image_obj.loaded = True
+
+    @staticmethod
+    def _bit_depth(image: Image.Image, array: np.ndarray) -> int:
+        if image.mode in {"I;16", "I;16B", "I;16L"}:
+            return 16
+        if image.mode == "1":
+            return 1
+        if image.mode in {"I", "F"}:
+            return 32
+        if array.dtype == np.uint16:
+            return 16
+        return 8
 
     @staticmethod
     def preprocess(image_obj: MammogramImage) -> None:
@@ -244,6 +274,20 @@ class ImageProcessor:
     @staticmethod
     def _largest_component_fallback(mask: np.ndarray) -> np.ndarray:
         """Fallback para encontrar maior componente conectado sem OpenCV."""
+        try:
+            from scipy import ndimage
+
+            structure = np.ones((3, 3), dtype=np.uint8)
+            labels, count = ndimage.label(mask > 0, structure=structure)
+            if count == 0:
+                return np.zeros_like(mask, dtype=np.uint8)
+            areas = np.bincount(labels.ravel())
+            areas[0] = 0
+            largest = int(np.argmax(areas))
+            return (labels == largest).astype(np.uint8)
+        except ImportError:
+            LOGGER.debug("scipy indisponivel; usando BFS para maior componente.")
+
         visited = np.zeros(mask.shape, dtype=bool)
         best_component: list[tuple[int, int]] = []
         height, width = mask.shape
@@ -291,27 +335,41 @@ class DatasetManager:
         records: list[ImageRecord] = []
         if not dataset_dir.exists():
             return records
-        for class_dir in sorted(dataset_dir.iterdir()):
-            if not class_dir.is_dir():
+        for path in sorted(dataset_dir.rglob("*")):
+            if not path.is_file() or path.suffix.lower() not in IMAGE_EXTENSIONS:
                 continue
-            class_name = class_dir.name.strip()[0].upper()
+            class_name = DatasetManager._class_name_from_path(path, dataset_dir)
+            if class_name is None:
+                LOGGER.debug("Ignorando imagem sem classe reconhecida: %s", path)
+                continue
+            number = DatasetManager._natural_number_from_name(path)
+            split = "test" if number % 4 == 0 else "train"
+            records.append(
+                ImageRecord(
+                    path=path,
+                    class_name=class_name,
+                    class_index=CLASS_TO_INDEX[class_name],
+                    number=number,
+                    split=split,
+                )
+            )
+        return records
+
+    @staticmethod
+    def _class_name_from_path(path: Path, dataset_dir: Path) -> str | None:
+        try:
+            relative_parts = path.relative_to(dataset_dir).parts[:-1]
+        except ValueError:
+            relative_parts = path.parts[:-1]
+        for part in reversed(relative_parts):
+            stripped = part.strip()
+            if not stripped:
+                continue
+            class_name = stripped[0].upper()
             if class_name not in CLASS_TO_INDEX:
                 continue
-            for path in sorted(class_dir.iterdir()):
-                if path.suffix.lower() not in IMAGE_EXTENSIONS:
-                    continue
-                number = DatasetManager._natural_number_from_name(path)
-                split = "test" if number % 4 == 0 else "train"
-                records.append(
-                    ImageRecord(
-                        path=path,
-                        class_name=class_name,
-                        class_index=CLASS_TO_INDEX[class_name],
-                        number=number,
-                        split=split,
-                    )
-                )
-        return records
+            return class_name
+        return None
 
     @staticmethod
     def summarize_records(records: Iterable[ImageRecord]) -> str:
@@ -351,6 +409,8 @@ class MammographyDataset(Dataset):
         self.train = train
         self.segmented = segmented
         self.image_size = image_size
+        if transforms is None:
+            raise RuntimeError("Instale torchvision para usar MammographyDataset.")
         self.samples: list[tuple[ImageRecord, int]] = []
         angles = ROTATION_ANGLES if train else [0]
         for record in records:
@@ -380,7 +440,7 @@ class MammographyDataset(Dataset):
         image = processor.to_display_image(gray).convert("RGB")
         if angle:
             image = image.rotate(angle, resample=Image.Resampling.BILINEAR, fillcolor=(0, 0, 0))
-        label = record.binary_index if self.task == "binary" else record.class_index
+        label = record.label_index(self.task)
         return self.transform(image), torch.tensor(label, dtype=torch.long)
 
 
@@ -400,20 +460,20 @@ class CNNTrainer:
     """
 
     @staticmethod
-    def build_model(model_name: str, num_classes: int) -> Any:
+    def build_model(model_name: str, num_classes: int, pretrained: bool = True) -> Any:
         """Constrói modelo com pesos pré-treinados."""
         if torch is None or models is None:
             raise RuntimeError("Instale PyTorch/torchvision para treinar.")
         
         if model_name == "resnet18":
-            weights = models.ResNet18_Weights.DEFAULT
+            weights = models.ResNet18_Weights.DEFAULT if pretrained else None
             model = models.resnet18(weights=weights)
             for parameter in model.parameters():
                 parameter.requires_grad = False
             model.fc = nn.Linear(model.fc.in_features, num_classes)
             return model
         if model_name == "efficientnet_b0":
-            weights = models.EfficientNet_B0_Weights.DEFAULT
+            weights = models.EfficientNet_B0_Weights.DEFAULT if pretrained else None
             model = models.efficientnet_b0(weights=weights)
             for parameter in model.parameters():
                 parameter.requires_grad = False
@@ -445,7 +505,14 @@ class CNNTrainer:
         num_classes = 2 if task == "binary" else 4
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         dataset = MammographyDataset(train_records, task=task, train=True, segmented=segmented)
-        loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+        use_cuda = torch.cuda.is_available()
+        loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=2 if use_cuda else 0,
+            pin_memory=use_cuda,
+        )
         model = CNNTrainer.build_model(model_name, num_classes).to(device)
         criterion = nn.CrossEntropyLoss()
         optimizer = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=learning_rate)
@@ -456,7 +523,7 @@ class CNNTrainer:
             running_loss = 0.0
             correct = 0
             total = 0
-            for inputs, labels in loader:
+            for batch_index, (inputs, labels) in enumerate(loader, start=1):
                 inputs = inputs.to(device)
                 labels = labels.to(device)
                 optimizer.zero_grad()
@@ -468,13 +535,29 @@ class CNNTrainer:
                 predictions = outputs.argmax(dim=1)
                 correct += int((predictions == labels).sum().item())
                 total += int(labels.size(0))
+                if batch_index == 1 or batch_index % 10 == 0 or batch_index == len(loader):
+                    progress(
+                        f"Epoca {epoch + 1}/{epochs} batch {batch_index}/{len(loader)}: "
+                        f"loss={running_loss / max(total, 1):.4f}"
+                    )
             progress(
                 f"Epoca {epoch + 1}/{epochs}: loss={running_loss / max(total, 1):.4f} "
                 f"acc={correct / max(total, 1):.4f}"
             )
         
         path = CNNTrainer._model_path(model_name, task, segmented)
-        torch.save({"model_state": model.state_dict(), "task": task, "model_name": model_name}, path)
+        torch.save(
+            {
+                "model_state": model.state_dict(),
+                "optimizer_state": optimizer.state_dict(),
+                "epoch": epochs,
+                "task": task,
+                "model_name": model_name,
+                "segmented": segmented,
+                "num_classes": num_classes,
+            },
+            path,
+        )
         progress(f"Treino concluido em {time.perf_counter() - start:.2f}s. Modelo salvo em {path}")
         return path
 
@@ -536,7 +619,14 @@ class Predictor:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         model = Predictor.load_model(model_name, task, segmented).to(device)
         dataset = MammographyDataset(test_records, task=task, train=False, segmented=segmented)
-        loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+        use_cuda = torch.cuda.is_available()
+        loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=2 if use_cuda else 0,
+            pin_memory=use_cuda,
+        )
         
         y_true: list[int] = []
         y_pred: list[int] = []
@@ -631,7 +721,7 @@ class GradCAMGenerator:
             raise RuntimeError("Instale PyTorch para gerar Grad-CAM.")
         
         model = Predictor.load_model(model_name, task, segmented)
-        target_layer = model.layer4[-1] if model_name == "resnet18" else model.features[-1]
+        target_layer = GradCAMGenerator._target_layer(model)
         activations: list[Any] = []
         gradients: list[Any] = []
 
@@ -645,13 +735,18 @@ class GradCAMGenerator:
         handle_b = target_layer.register_full_backward_hook(backward_hook)
         model.eval()
         
-        tensor = GradCAMGenerator._preprocess_for_model(image_path, segmented)
-        output = model(tensor)
-        predicted = int(output.argmax(dim=1).item())
-        model.zero_grad()
-        output[0, predicted].backward()
-        handle_f.remove()
-        handle_b.remove()
+        try:
+            tensor = GradCAMGenerator._preprocess_for_model(image_path, segmented)
+            output = model(tensor)
+            predicted = int(output.argmax(dim=1).item())
+            model.zero_grad()
+            output[0, predicted].backward()
+        finally:
+            handle_f.remove()
+            handle_b.remove()
+
+        if not activations or not gradients:
+            raise RuntimeError("Nao foi possivel capturar ativacoes/gradientes para Grad-CAM.")
 
         weights = gradients[0].mean(dim=(2, 3), keepdim=True)
         cam = (weights * activations[0]).sum(dim=1).squeeze().numpy()
@@ -675,6 +770,16 @@ class GradCAMGenerator:
         if task == "four":
             label = f"{CLASS_NAMES[predicted]} - {BIRADS_LABELS[CLASS_NAMES[predicted]]}"
         return label, overlay
+
+    @staticmethod
+    def _target_layer(model: Any) -> Any:
+        if hasattr(model, "layer4"):
+            return model.layer4[-1]
+        if hasattr(model, "features"):
+            for module in reversed(model.features):
+                if isinstance(module, nn.Conv2d) or any(isinstance(child, nn.Conv2d) for child in module.modules()):
+                    return module
+        raise ValueError("Nao foi possivel identificar a ultima camada convolucional do modelo.")
 
     @staticmethod
     def _preprocess_for_model(path: Path, segmented: bool, image_size: int = IMAGE_DEFAULT_SIZE) -> Any:
@@ -822,13 +927,16 @@ class MammographyApp(tk.Tk):
         )
         if not filename:
             return
-        self.current_path = Path(filename)
-        self.current_image = MammogramImage(self.current_path)
-        ImageProcessor.load_image(self.current_image)
-        self.current_display = ImageProcessor.to_display_image(self.current_image.preprocessed)
-        self.zoom_var.set(1.0)
-        self.refresh_image()
-        self.log_message(f"Imagem aberta: {self.current_path}")
+        try:
+            self.current_path = Path(filename)
+            self.current_image = MammogramImage(self.current_path)
+            ImageProcessor.load_image(self.current_image)
+            self.current_display = ImageProcessor.to_display_image(self.current_image.preprocessed)
+            self.zoom_var.set(1.0)
+            self.refresh_image()
+            self.log_message(f"Imagem aberta: {self.current_path}")
+        except Exception as exc:
+            messagebox.showerror("Abrir imagem", str(exc))
 
     def refresh_image(self) -> None:
         """Atualiza visualização da imagem com zoom."""
@@ -868,6 +976,7 @@ class MammographyApp(tk.Tk):
                 if result:
                     self.log_message(result)
             except Exception as exc:
+                LOGGER.exception("Erro em tarefa de background")
                 self.log_message(f"ERRO: {exc}")
 
         threading.Thread(target=wrapper, daemon=True).start()
@@ -924,8 +1033,11 @@ class MammographyApp(tk.Tk):
                 self.segmented_var.get(),
                 self.current_path,
             )
-            self.current_display = overlay
-            self.after(0, self.refresh_image)
+            def update_display() -> None:
+                self.current_display = overlay
+                self.refresh_image()
+
+            self.after(0, update_display)
             return f"Grad-CAM concluido. Classificacao: {label}"
 
         self.run_background(job)
