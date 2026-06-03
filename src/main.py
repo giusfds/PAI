@@ -834,6 +834,16 @@ class MammographyApp(tk.Tk):
         self.tk_image = None
         self.message_queue: queue.Queue[str] = queue.Queue()
 
+        # Estado da aba de classificação
+        self.classif_path: Path | None = None
+        self.classif_image: MammogramImage | None = None
+        self._tk_orig = None
+        self._tk_mask = None
+        self._tk_seg = None
+
+        # Flag para cancelar treino entre batches
+        self._cancel_flag = threading.Event()
+
         self.model_var = tk.StringVar(value="resnet18")
         self.task_var = tk.StringVar(value="binary")
         self.segmented_var = tk.BooleanVar(value=True)
@@ -847,83 +857,245 @@ class MammographyApp(tk.Tk):
         if self.dataset_dir.exists():
             self.load_dataset(self.dataset_dir)
 
+    # ------------------------------------------------------------------ layout
+
     def build_layout(self) -> None:
-        """Constrói a interface gráfica."""
+        """Constrói a interface com sidebar dinâmica e duas abas."""
         self.columnconfigure(1, weight=1)
         self.rowconfigure(0, weight=1)
 
-        panel = ttk.Frame(self, padding=10)
-        panel.grid(row=0, column=0, sticky="ns")
+        # Container da sidebar — largura fixa
+        self._sidebar_container = ttk.Frame(self, padding=6, width=215)
+        self._sidebar_container.grid(row=0, column=0, sticky="ns")
+        self._sidebar_container.grid_propagate(False)
+        self._sidebar_container.columnconfigure(0, weight=1)
+        self._sidebar_container.rowconfigure(0, weight=1)
 
-        ttk.Button(panel, text="Abrir imagem", command=self.open_image).grid(row=0, column=0, sticky="ew", pady=3)
-        ttk.Button(panel, text="Selecionar dataset", command=self.choose_dataset).grid(row=1, column=0, sticky="ew", pady=3)
-        ttk.Button(panel, text="Segmentar imagem", command=self.segment_current).grid(row=2, column=0, sticky="ew", pady=3)
+        self._sidebar_train = ttk.Frame(self._sidebar_container)
+        self._sidebar_train.grid(row=0, column=0, sticky="nsew")
+        self._build_sidebar_train(self._sidebar_train)
 
-        ttk.Separator(panel).grid(row=3, column=0, sticky="ew", pady=8)
-        ttk.Label(panel, text="Modelo").grid(row=4, column=0, sticky="w")
-        ttk.Combobox(panel, textvariable=self.model_var, values=["resnet18", "efficientnet_b0"], state="readonly").grid(
-            row=5, column=0, sticky="ew"
+        self._sidebar_classif = ttk.Frame(self._sidebar_container)
+        self._build_sidebar_classif(self._sidebar_classif)
+
+        # Notebook principal
+        self.notebook = ttk.Notebook(self)
+        self.notebook.grid(row=0, column=1, sticky="nsew")
+        self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_change)
+
+        tab_train = ttk.Frame(self.notebook, padding=6)
+        self.notebook.add(tab_train, text="  Treinamento  ")
+        self._build_train_tab(tab_train)
+
+        tab_classif = ttk.Frame(self.notebook, padding=6)
+        self.notebook.add(tab_classif, text="  Classificação  ")
+        self._build_classif_tab(tab_classif)
+
+    def _on_tab_change(self, _event=None) -> None:
+        idx = self.notebook.index(self.notebook.select())
+        if idx == 0:
+            self._sidebar_classif.grid_remove()
+            self._sidebar_train.grid(row=0, column=0, sticky="nsew")
+        else:
+            self._sidebar_train.grid_remove()
+            self._sidebar_classif.grid(row=0, column=0, sticky="nsew")
+
+    def _build_sidebar_train(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
+        r = 0
+
+        ttk.Button(parent, text="Selecionar dataset", command=self.choose_dataset).grid(
+            row=r, column=0, sticky="ew", pady=3); r += 1
+        ttk.Button(parent, text="Abrir imagem", command=self.open_image).grid(
+            row=r, column=0, sticky="ew", pady=3); r += 1
+        ttk.Button(parent, text="Segmentar imagem", command=self.segment_current).grid(
+            row=r, column=0, sticky="ew", pady=3); r += 1
+
+        ttk.Separator(parent).grid(row=r, column=0, sticky="ew", pady=8); r += 1
+
+        ttk.Label(parent, text="Modelo").grid(row=r, column=0, sticky="w"); r += 1
+        ttk.Combobox(
+            parent, textvariable=self.model_var,
+            values=["resnet18", "efficientnet_b0"], state="readonly",
+        ).grid(row=r, column=0, sticky="ew"); r += 1
+
+        ttk.Label(parent, text="Tarefa").grid(row=r, column=0, sticky="w", pady=(8, 0)); r += 1
+        ttk.Combobox(
+            parent, textvariable=self.task_var,
+            values=["binary", "four"], state="readonly",
+        ).grid(row=r, column=0, sticky="ew"); r += 1
+
+        ttk.Checkbutton(
+            parent, text="Usar imagens segmentadas", variable=self.segmented_var,
+        ).grid(row=r, column=0, sticky="w", pady=5); r += 1
+
+        ttk.Label(parent, text="Épocas").grid(row=r, column=0, sticky="w"); r += 1
+        ttk.Spinbox(parent, from_=1, to=50, textvariable=self.epochs_var, width=8).grid(
+            row=r, column=0, sticky="ew"); r += 1
+
+        ttk.Label(parent, text="Batch").grid(row=r, column=0, sticky="w"); r += 1
+        ttk.Spinbox(parent, from_=1, to=64, textvariable=self.batch_var, width=8).grid(
+            row=r, column=0, sticky="ew"); r += 1
+
+        ttk.Label(parent, text="Learning Rate").grid(row=r, column=0, sticky="w"); r += 1
+        ttk.Entry(parent, textvariable=self.lr_var).grid(row=r, column=0, sticky="ew"); r += 1
+
+        ttk.Separator(parent).grid(row=r, column=0, sticky="ew", pady=8); r += 1
+
+        ttk.Button(parent, text="Treinar", command=self.train_selected).grid(
+            row=r, column=0, sticky="ew", pady=3); r += 1
+        ttk.Button(parent, text="Cancelar treinamento", command=self.cancel_training).grid(
+            row=r, column=0, sticky="ew", pady=3); r += 1
+        ttk.Button(parent, text="Avaliar teste", command=self.evaluate_selected).grid(
+            row=r, column=0, sticky="ew", pady=3); r += 1
+        ttk.Button(parent, text="Exportar modelo", command=self.export_model).grid(
+            row=r, column=0, sticky="ew", pady=3); r += 1
+
+        ttk.Separator(parent).grid(row=r, column=0, sticky="ew", pady=8); r += 1
+
+        ttk.Label(parent, text="Zoom").grid(row=r, column=0, sticky="w"); r += 1
+        ttk.Scale(
+            parent, from_=0.2, to=3.0, variable=self.zoom_var,
+            command=lambda _v: self.refresh_image(),
+        ).grid(row=r, column=0, sticky="ew"); r += 1
+
+        ttk.Separator(parent).grid(row=r, column=0, sticky="ew", pady=8); r += 1
+
+        ttk.Button(parent, text="Grad-CAM", command=self.run_grad_cam).grid(
+            row=r, column=0, sticky="ew", pady=3); r += 1
+
+    def _build_sidebar_classif(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
+        r = 0
+
+        ttk.Button(parent, text="Selecionar imagem", command=self.classif_open_image).grid(
+            row=r, column=0, sticky="ew", pady=3); r += 1
+
+        ttk.Separator(parent).grid(row=r, column=0, sticky="ew", pady=8); r += 1
+
+        ttk.Label(parent, text="Zoom").grid(row=r, column=0, sticky="w"); r += 1
+        ttk.Scale(
+            parent, from_=0.2, to=3.0, variable=self.zoom_var,
+            command=lambda _v: self.classif_refresh_images(),
+        ).grid(row=r, column=0, sticky="ew"); r += 1
+
+        ttk.Separator(parent).grid(row=r, column=0, sticky="ew", pady=8); r += 1
+
+        ttk.Button(parent, text="Classificar", command=self.classif_run).grid(
+            row=r, column=0, sticky="ew", pady=3); r += 1
+
+    def _build_train_tab(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
+        parent.columnconfigure(1, weight=1)
+        parent.rowconfigure(0, weight=1)
+        parent.rowconfigure(1, weight=2)
+
+        chart1_frame = ttk.LabelFrame(parent, text="Gráfico 1", padding=4)
+        chart1_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 4), pady=(0, 4))
+        chart1_frame.rowconfigure(0, weight=1)
+        chart1_frame.columnconfigure(0, weight=1)
+        self.chart1_canvas = tk.Canvas(chart1_frame, background="#1a1a2e", highlightthickness=0)
+        self.chart1_canvas.grid(row=0, column=0, sticky="nsew")
+
+        chart2_frame = ttk.LabelFrame(parent, text="Gráfico 2 / Visualização", padding=4)
+        chart2_frame.grid(row=0, column=1, sticky="nsew", padx=(4, 0), pady=(0, 4))
+        chart2_frame.rowconfigure(0, weight=1)
+        chart2_frame.columnconfigure(0, weight=1)
+        self.chart2_canvas = tk.Canvas(chart2_frame, background="#1a1a2e", highlightthickness=0)
+        self.chart2_canvas.grid(row=0, column=0, sticky="nsew")
+
+        # Alias usado por refresh_image / run_grad_cam
+        self.canvas = self.chart2_canvas
+
+        log_frame = ttk.LabelFrame(parent, text="Log", padding=4)
+        log_frame.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(4, 0))
+        log_frame.rowconfigure(0, weight=1)
+        log_frame.columnconfigure(0, weight=1)
+        self.log = tk.Text(
+            log_frame,
+            wrap="word",
+            background="#0d1117",
+            foreground="#c9d1d9",
+            insertbackground="#c9d1d9",
+            font=("Courier", 9),
         )
-        ttk.Label(panel, text="Tarefa").grid(row=6, column=0, sticky="w", pady=(8, 0))
-        ttk.Combobox(panel, textvariable=self.task_var, values=["binary", "four"], state="readonly").grid(
-            row=7, column=0, sticky="ew"
+        scrollbar = ttk.Scrollbar(log_frame, command=self.log.yview)
+        self.log.configure(yscrollcommand=scrollbar.set)
+        self.log.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+
+    def _build_classif_tab(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
+        parent.columnconfigure(1, weight=1)
+        parent.columnconfigure(2, weight=1)
+        parent.rowconfigure(0, weight=3)
+        parent.rowconfigure(1, weight=2)
+
+        orig_frame = ttk.LabelFrame(parent, text="Imagem Original", padding=4)
+        orig_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 4), pady=(0, 4))
+        orig_frame.rowconfigure(0, weight=1)
+        orig_frame.columnconfigure(0, weight=1)
+        self.classif_canvas_orig = tk.Canvas(orig_frame, background="#111111", highlightthickness=0)
+        self.classif_canvas_orig.grid(row=0, column=0, sticky="nsew")
+
+        mask_frame = ttk.LabelFrame(parent, text="Máscara", padding=4)
+        mask_frame.grid(row=0, column=1, sticky="nsew", padx=4, pady=(0, 4))
+        mask_frame.rowconfigure(0, weight=1)
+        mask_frame.columnconfigure(0, weight=1)
+        self.classif_canvas_mask = tk.Canvas(mask_frame, background="#111111", highlightthickness=0)
+        self.classif_canvas_mask.grid(row=0, column=0, sticky="nsew")
+
+        seg_frame = ttk.LabelFrame(parent, text="Imagem Segmentada", padding=4)
+        seg_frame.grid(row=0, column=2, sticky="nsew", padx=(4, 0), pady=(0, 4))
+        seg_frame.rowconfigure(0, weight=1)
+        seg_frame.columnconfigure(0, weight=1)
+        self.classif_canvas_seg = tk.Canvas(seg_frame, background="#111111", highlightthickness=0)
+        self.classif_canvas_seg.grid(row=0, column=0, sticky="nsew")
+
+        result_frame = ttk.LabelFrame(parent, text="Resultado da Classificação", padding=8)
+        result_frame.grid(row=1, column=0, columnspan=3, sticky="nsew", pady=(4, 0))
+        result_frame.rowconfigure(0, weight=1)
+        result_frame.columnconfigure(0, weight=1)
+        self.classif_result_text = tk.Text(
+            result_frame,
+            wrap="word",
+            background="#0d1117",
+            foreground="#c9d1d9",
+            insertbackground="#c9d1d9",
+            font=("Courier", 12),
+            state="disabled",
         )
-        ttk.Checkbutton(panel, text="Usar imagens segmentadas", variable=self.segmented_var).grid(
-            row=8, column=0, sticky="w", pady=5
-        )
+        self.classif_result_text.grid(row=0, column=0, sticky="nsew")
 
-        ttk.Label(panel, text="Epocas").grid(row=9, column=0, sticky="w")
-        ttk.Spinbox(panel, from_=1, to=50, textvariable=self.epochs_var, width=8).grid(row=10, column=0, sticky="ew")
-        ttk.Label(panel, text="Batch").grid(row=11, column=0, sticky="w")
-        ttk.Spinbox(panel, from_=1, to=64, textvariable=self.batch_var, width=8).grid(row=12, column=0, sticky="ew")
-        ttk.Label(panel, text="Learning rate").grid(row=13, column=0, sticky="w")
-        ttk.Entry(panel, textvariable=self.lr_var).grid(row=14, column=0, sticky="ew")
-
-        ttk.Button(panel, text="Treinar", command=self.train_selected).grid(row=15, column=0, sticky="ew", pady=(10, 3))
-        ttk.Button(panel, text="Avaliar teste", command=self.evaluate_selected).grid(row=16, column=0, sticky="ew", pady=3)
-        ttk.Button(panel, text="Grad-CAM", command=self.run_grad_cam).grid(row=17, column=0, sticky="ew", pady=3)
-
-        ttk.Separator(panel).grid(row=18, column=0, sticky="ew", pady=8)
-        ttk.Label(panel, text="Zoom").grid(row=19, column=0, sticky="w")
-        ttk.Scale(panel, from_=0.2, to=3.0, variable=self.zoom_var, command=lambda _value: self.refresh_image()).grid(
-            row=20, column=0, sticky="ew"
-        )
-
-        image_frame = ttk.Frame(self, padding=10)
-        image_frame.grid(row=0, column=1, sticky="nsew")
-        image_frame.rowconfigure(0, weight=1)
-        image_frame.columnconfigure(0, weight=1)
-        self.canvas = tk.Canvas(image_frame, background="#111111", highlightthickness=0)
-        self.canvas.grid(row=0, column=0, sticky="nsew")
-        self.log = tk.Text(image_frame, height=10, wrap="word")
-        self.log.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+    # ------------------------------------------------------------------ logging
 
     def log_message(self, message: str) -> None:
-        """Adiciona mensagem à fila para exibição."""
         self.message_queue.put(message)
 
     def flush_messages(self) -> None:
-        """Exibe mensagens da fila no log."""
         while not self.message_queue.empty():
             message = self.message_queue.get()
             self.log.insert("end", message + "\n")
             self.log.see("end")
         self.after(200, self.flush_messages)
 
+    # ------------------------------------------------------------------ dataset
+
     def load_dataset(self, dataset_dir: Path) -> None:
-        """Carrega dataset do diretório."""
         self.dataset_dir = dataset_dir
         self.records = DatasetManager.discover_dataset(dataset_dir)
         self.log_message(f"Dataset carregado: {dataset_dir}\n{DatasetManager.summarize_records(self.records)}")
 
     def choose_dataset(self) -> None:
-        """Abre diálogo para selecionar dataset."""
-        directory = filedialog.askdirectory(initialdir=str(self.dataset_dir if self.dataset_dir.exists() else Path.cwd()))
+        directory = filedialog.askdirectory(
+            initialdir=str(self.dataset_dir if self.dataset_dir.exists() else Path.cwd())
+        )
         if directory:
             self.load_dataset(Path(directory))
 
+    # ------------------------------------------------------------------ training-tab image viewer
+
     def open_image(self) -> None:
-        """Abre diálogo para selecionar imagem."""
         filename = filedialog.askopenfilename(
             filetypes=[("Imagens", "*.png *.tif *.tiff"), ("PNG", "*.png"), ("TIFF", "*.tif *.tiff")]
         )
@@ -941,7 +1113,6 @@ class MammographyApp(tk.Tk):
             messagebox.showerror("Abrir imagem", str(exc))
 
     def refresh_image(self) -> None:
-        """Atualiza visualização da imagem com zoom."""
         if self.current_display is None:
             return
         zoom = float(self.zoom_var.get())
@@ -954,24 +1125,26 @@ class MammographyApp(tk.Tk):
         self.canvas.configure(scrollregion=(0, 0, width, height))
 
     def segment_current(self) -> None:
-        """Segmenta a imagem atual."""
         if self.current_image is None:
             messagebox.showinfo("Segmentacao", "Abra uma imagem primeiro.")
             return
         ImageProcessor.segment_breast(self.current_image)
         self.current_display = ImageProcessor.to_display_image(self.current_image.segmented)
         self.refresh_image()
-        self.log_message("Segmentacao aplicada: fundo e anotacoes foram zerados quando possivel.")
+        self.log_message("Segmentacao aplicada.")
+
+    # ------------------------------------------------------------------ training
 
     def ensure_records(self) -> bool:
-        """Verifica se há dataset carregado."""
         if not self.records:
-            messagebox.showinfo("Dataset", f"Selecione o diretorio do dataset antes. Atual: {self.dataset_dir}")
+            messagebox.showinfo(
+                "Dataset",
+                f"Selecione o diretorio do dataset antes. Atual: {self.dataset_dir}",
+            )
             return False
         return True
 
     def run_background(self, job: Callable[[], str | None]) -> None:
-        """Executa tarefa em thread separada."""
         def wrapper() -> None:
             try:
                 result = job()
@@ -983,29 +1156,58 @@ class MammographyApp(tk.Tk):
 
         threading.Thread(target=wrapper, daemon=True).start()
 
+    def cancel_training(self) -> None:
+        self._cancel_flag.set()
+        self.log_message("Cancelamento solicitado. O treino parará ao final do batch atual.")
+
+    def export_model(self) -> None:
+        src = CNNTrainer._model_path(self.model_var.get(), self.task_var.get(), self.segmented_var.get())
+        if not src.exists():
+            messagebox.showinfo(
+                "Exportar modelo",
+                f"Modelo não encontrado: {src}\nTreine o modelo primeiro.",
+            )
+            return
+        dest = filedialog.asksaveasfilename(
+            defaultextension=".pt",
+            filetypes=[("PyTorch model", "*.pt"), ("Todos os arquivos", "*.*")],
+            initialfile=src.name,
+        )
+        if dest:
+            import shutil
+            shutil.copy2(src, dest)
+            self.log_message(f"Modelo exportado para: {dest}")
+
     def train_selected(self) -> None:
-        """Treina modelo selecionado."""
         if not self.ensure_records():
             return
+        self._cancel_flag.clear()
         self.log_message("Iniciando treino. A interface continua responsiva; acompanhe o log.")
 
+        def progress(message: str) -> None:
+            if self._cancel_flag.is_set():
+                raise InterruptedError("Treinamento cancelado pelo usuario.")
+            self.log_message(message)
+
         def job() -> str:
-            path = CNNTrainer.train(
-                self.records,
-                self.model_var.get(),
-                self.task_var.get(),
-                self.segmented_var.get(),
-                int(self.epochs_var.get()),
-                int(self.batch_var.get()),
-                float(self.lr_var.get()),
-                self.log_message,
-            )
-            return f"Modelo pronto: {path}"
+            try:
+                path = CNNTrainer.train(
+                    self.records,
+                    self.model_var.get(),
+                    self.task_var.get(),
+                    self.segmented_var.get(),
+                    int(self.epochs_var.get()),
+                    int(self.batch_var.get()),
+                    float(self.lr_var.get()),
+                    progress,
+                )
+                return f"Modelo pronto: {path}"
+            except InterruptedError as exc:
+                return f"Treino interrompido: {exc}"
 
         self.run_background(job)
 
     def evaluate_selected(self) -> None:
-        """Avalia modelo no conjunto de teste."""
         if not self.ensure_records():
             return
         self.log_message("Avaliando conjunto de teste...")
@@ -1022,7 +1224,6 @@ class MammographyApp(tk.Tk):
         self.run_background(job)
 
     def run_grad_cam(self) -> None:
-        """Gera Grad-CAM para imagem atual."""
         if self.current_path is None:
             messagebox.showinfo("Grad-CAM", "Abra uma imagem primeiro.")
             return
@@ -1035,6 +1236,7 @@ class MammographyApp(tk.Tk):
                 self.segmented_var.get(),
                 self.current_path,
             )
+
             def update_display() -> None:
                 self.current_display = overlay
                 self.refresh_image()
@@ -1043,6 +1245,105 @@ class MammographyApp(tk.Tk):
             return f"Grad-CAM concluido. Classificacao: {label}"
 
         self.run_background(job)
+
+    # ------------------------------------------------------------------ classification tab
+
+    def classif_open_image(self) -> None:
+        filename = filedialog.askopenfilename(
+            filetypes=[
+                ("Imagens", "*.png *.tif *.tiff *.jpg *.jpeg"),
+                ("PNG", "*.png"),
+                ("TIFF", "*.tif *.tiff"),
+            ]
+        )
+        if not filename:
+            return
+        try:
+            self.classif_path = Path(filename)
+            self.classif_image = MammogramImage(self.classif_path)
+            ImageProcessor.load_image(self.classif_image)
+            ImageProcessor.segment_breast(self.classif_image)
+            self.zoom_var.set(1.0)
+            # Aguarda o layout ser renderizado antes de desenhar
+            self.after(50, self.classif_refresh_images)
+            self.log_message(f"Imagem carregada para classificação: {self.classif_path.name}")
+        except Exception as exc:
+            messagebox.showerror("Selecionar imagem", str(exc))
+
+    def classif_refresh_images(self) -> None:
+        if self.classif_image is None:
+            return
+        zoom = float(self.zoom_var.get())
+        if self.classif_image.original is not None:
+            self._render_on_canvas(
+                self.classif_canvas_orig,
+                ImageProcessor.to_display_image(self.classif_image.original),
+                zoom,
+                "_tk_orig",
+            )
+        if self.classif_image.mask is not None:
+            self._render_on_canvas(
+                self.classif_canvas_mask,
+                ImageProcessor.to_display_image(self.classif_image.mask),
+                zoom,
+                "_tk_mask",
+            )
+        if self.classif_image.segmented is not None:
+            self._render_on_canvas(
+                self.classif_canvas_seg,
+                ImageProcessor.to_display_image(self.classif_image.segmented),
+                zoom,
+                "_tk_seg",
+            )
+
+    def _render_on_canvas(
+        self, canvas: tk.Canvas, pil_image: Image.Image, zoom: float, attr: str
+    ) -> None:
+        cw = max(canvas.winfo_width(), 1)
+        ch = max(canvas.winfo_height(), 1)
+        iw, ih = pil_image.size
+        # zoom=1.0 → fit-to-canvas; qualquer outro valor escala em relação ao fit
+        fit_scale = min(cw / iw, ch / ih)
+        scale = fit_scale * zoom
+        nw = max(1, int(iw * scale))
+        nh = max(1, int(ih * scale))
+        resized = pil_image.resize((nw, nh), Image.Resampling.LANCZOS)
+        tk_img = ImageTk.PhotoImage(resized)
+        setattr(self, attr, tk_img)
+        canvas.delete("all")
+        canvas.create_image(cw // 2, ch // 2, image=tk_img, anchor="center")
+
+    @staticmethod
+    def _classify_image(image_obj: MammogramImage) -> dict:
+        """Stub isolado para classificação — substituir pela chamada ao Predictor real."""
+        import random
+        raw = {label: random.random() for label in BIRADS_LABELS.values()}
+        total = sum(raw.values())
+        scores = {k: v / total for k, v in raw.items()}
+        best = max(scores, key=scores.__getitem__)
+        return {"label": best, "scores": scores}
+
+    def classif_run(self) -> None:
+        if self.classif_image is None:
+            messagebox.showinfo("Classificar", "Selecione uma imagem primeiro.")
+            return
+        image_obj = self.classif_image
+
+        def job() -> None:
+            result = MammographyApp._classify_image(image_obj)
+            self.after(0, lambda: self._show_classif_result(result))
+
+        threading.Thread(target=job, daemon=True).start()
+
+    def _show_classif_result(self, result: dict) -> None:
+        label = result["label"]
+        scores = result["scores"]
+        pct_str = "  |  ".join(f"{k} = {v * 100:.1f}%" for k, v in scores.items())
+        text = f"Classificação: {label}\n\n{pct_str}"
+        self.classif_result_text.config(state="normal")
+        self.classif_result_text.delete("1.0", "end")
+        self.classif_result_text.insert("end", text)
+        self.classif_result_text.config(state="disabled")
 
 
 # ============================================================================
