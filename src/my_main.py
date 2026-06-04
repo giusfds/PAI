@@ -1,8 +1,9 @@
 import re
 import queue
-import threading
+import time
 import torch
 import logging
+import threading
 import numpy as np
 import tkinter as tk
 import torch.nn as nn
@@ -18,6 +19,14 @@ from torchvision import models, transforms
 from tkinter import ttk, filedialog, messagebox
 from torch.utils.data import DataLoader, Dataset
 from pytorch_grad_cam.utils.image import show_cam_on_image
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    confusion_matrix,
+    classification_report,
+)
 
 # =============================================================
 # LOGGING
@@ -39,7 +48,7 @@ class LogLevel(Enum):
     WARNING = logging.WARNING
     ERROR = logging.ERROR
 
-LOG_LEVEL = LogLevel.DEBUG
+LOG_LEVEL = LogLevel.INFO
 
 LOGGER = logging.getLogger("PAI")
 LOGGER.addHandler(_rich_handler)
@@ -104,7 +113,7 @@ class DatasetConfig:
 class TrainingConfig:
     """Configuração de treino para o ciclo de treinamento do modelo."""
     model_type: ModelType = ModelType.RESNET18
-    epochs: int = 10
+    epochs: int = 8
     batch_size: int = 16
     learning_rate: float = 0.001
     binary_classification: bool = True
@@ -425,11 +434,6 @@ class DataAugmentationProcessor:
 
         return rotated.astype(image.dtype)
 
-    @staticmethod
-    def generate(image: np.ndarray) -> list[np.ndarray]:
-        """Gera imagens rotacionadas para aumentar o conjunto de dados."""
-        return [DataAugmentationProcessor.rotate(image, angle) for angle in DataAugmentationProcessor.ROTATIONS]
-
 # =============================================================
 # TRANSFORMAÇÃO
 # =============================================================
@@ -505,9 +509,46 @@ class MammographyDataset(Dataset):
 # TREINAMENTO E CLASSIFICAÇÃO
 # =============================================================
 
-class TrainingManager:
-    """Gerencia o ciclo de treino, validação e persistência do modelo."""
+class MetricsCalculator:
+    @staticmethod
+    def binary_metrics(y_true, y_pred):
+        cm = confusion_matrix(y_true, y_pred)
+        tn, fp, fn, tp = cm.ravel()
 
+        return {
+            "accuracy": accuracy_score(y_true, y_pred),
+            "precision": precision_score(y_true, y_pred, zero_division=0),
+            "sensitivity": recall_score(y_true, y_pred, zero_division=0),
+            "specificity": tn / (tn + fp),
+            "f1": f1_score(y_true, y_pred, zero_division=0),
+            "confusion_matrix": cm,
+            "report": classification_report(y_true, y_pred, zero_division=0)
+        }
+
+    @staticmethod
+    def multiclass_metrics(y_true, y_pred):
+        cm = confusion_matrix(y_true, y_pred)
+        recalls = recall_score(y_true, y_pred, average=None, zero_division=0)
+
+        specificities = []
+        for i in range(cm.shape[0]):
+            tp = cm[i, i]
+            fn = cm[i, :].sum() - tp
+            fp = cm[:, i].sum() - tp
+            tn = cm.sum() - tp - fn - fp
+            specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
+
+            specificities.append(specificity)
+
+        return {
+            "accuracy": accuracy_score(y_true, y_pred),
+            "mean_sensitivity": recalls.mean(),
+            "mean_specificity": np.mean(specificities),
+            "confusion_matrix": cm,
+            "report": classification_report(y_true, y_pred, zero_division=0)
+        }
+
+class TrainingManager:
     def __init__(
         self,
         train_dataset: MammographyDataset,
@@ -516,7 +557,7 @@ class TrainingManager:
         progress_callback: Callable[[int, int, float, float, float, float], None] | None = None
     ):
         self.config = config
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = self._get_device()
         self.progress_callback = progress_callback
 
         self.train_loader = DataLoader(
@@ -537,10 +578,7 @@ class TrainingManager:
 
         self.model = self._create_model()
         self.criterion = nn.CrossEntropyLoss()
-        self.optimizer = torch.optim.Adam(
-            self.model.parameters(),
-            lr=config.learning_rate
-        )
+        self.optimizer = torch.optim.Adam(self.trainable_parameters, lr=config.learning_rate)
 
         self.history: dict[str, list[float]] = {
             "train_loss": [],
@@ -550,18 +588,52 @@ class TrainingManager:
         }
 
         self.cancel_requested = False
+    
+    def _get_device(self) -> torch.device:
+        if torch.cuda.is_available():
+            LOGGER.info("GPU detectada: %s", torch.cuda.get_device_name(0))
+            return torch.device("cuda")
+
+        LOGGER.warning("GPU não encontrada. Utilizando CPU.")
+        return torch.device("cpu")
 
     def _create_model(self) -> nn.Module:
-        """Cria o modelo e adapta a última camada para o número de classes."""
         num_classes = 2 if self.config.binary_classification else 4
 
         if self.config.model_type == ModelType.RESNET18:
             model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
+            for param in model.parameters():
+                param.requires_grad = False
             model.fc = nn.Linear(model.fc.in_features, num_classes)
+            self.trainable_parameters = model.fc.parameters()
 
         elif self.config.model_type == ModelType.EFFICIENTNET_B0:
             model = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.DEFAULT)
+            for param in model.parameters():
+                param.requires_grad = False
             model.classifier[1] = nn.Linear(model.classifier[1].in_features, num_classes)
+            self.trainable_parameters = model.classifier[1].parameters()
+
+        elif self.config.model_type == ModelType.EFFICIENTNET_B1:
+            model = models.efficientnet_b1(weights=models.EfficientNet_B1_Weights.DEFAULT)
+            for param in model.parameters():
+                param.requires_grad = False
+            model.classifier[1] = nn.Linear(model.classifier[1].in_features, num_classes)
+            self.trainable_parameters = model.classifier[1].parameters()
+
+        elif self.config.model_type == ModelType.EFFICIENTNET_B2:
+            model = models.efficientnet_b2(weights=models.EfficientNet_B2_Weights.DEFAULT)
+            for param in model.parameters():
+                param.requires_grad = False
+            model.classifier[1] = nn.Linear(model.classifier[1].in_features, num_classes)
+            self.trainable_parameters = model.classifier[1].parameters()
+
+        elif self.config.model_type == ModelType.EFFICIENTNET_B3:
+            model = models.efficientnet_b3(weights=models.EfficientNet_B3_Weights.DEFAULT)
+            for param in model.parameters():
+                param.requires_grad = False
+            model.classifier[1] = nn.Linear(model.classifier[1].in_features, num_classes)
+            self.trainable_parameters = model.classifier[1].parameters()
 
         else:
             raise ValueError(f"Modelo não suportado: {self.config.model_type}")
@@ -569,7 +641,6 @@ class TrainingManager:
         return model.to(self.device)
 
     def train_epoch(self) -> tuple[float, float]:
-        """Executa uma única época de treino e retorna loss e acurácia."""
         self.model.train()
 
         total_loss = 0.0
@@ -600,7 +671,6 @@ class TrainingManager:
         return total_loss / total, correct / total
 
     def validate(self) -> tuple[float, float]:
-        """Avalia o modelo no conjunto de validação."""
         self.model.eval()
 
         total_loss = 0.0
@@ -629,7 +699,8 @@ class TrainingManager:
         return total_loss / total, correct / total
 
     def train(self) -> dict[str, list[float]]:
-        """Realiza o treino completo e registra métricas por época."""
+        start_time = time.perf_counter()
+
         for epoch in range(1, self.config.epochs + 1):
             if self.cancel_requested:
                 LOGGER.warning("Treinamento cancelado na época %d.", epoch)
@@ -662,24 +733,24 @@ class TrainingManager:
                 val_loss,
                 val_acc
             )
+        
+        total_time = time.perf_counter() - start_time
+        LOGGER.info("Treinamento concluído em %.2f segundos.", total_time)
 
-        return self.history
+        return self.history, total_time
 
     def save_model(self, path: Path | None = None) -> None:
-        """Salva o estado do modelo em disco."""
         path = path or self.config.model_path
         torch.save(self.model.state_dict(), path)
         LOGGER.info("Modelo salvo em %s", path)
 
     def load_model(self, path: Path | None = None) -> None:
-        """Carrega o estado do modelo a partir de disco."""
         path = path or self.config.model_path
         self.model.load_state_dict(torch.load(path, map_location=self.device))
         self.model.eval()
         LOGGER.info("Modelo carregado de %s", path)
 
     def predict(self, image_tensor: torch.Tensor) -> tuple[int, torch.Tensor]:
-        """Realiza inferência de uma imagem preparada e retorna classe e probabilidades."""
         self.model.eval()
 
         with torch.no_grad():
@@ -688,6 +759,29 @@ class TrainingManager:
             prediction = int(probabilities.argmax(dim=0).item())
 
         return prediction, probabilities
+    
+    def evaluate(self):
+        self.model.eval()
+
+        y_true = []
+        y_pred = []
+
+        with torch.no_grad():
+            for images, labels in self.test_loader:
+
+                images = images.to(self.device)
+
+                outputs = self.model(images)
+
+                predictions = outputs.argmax(dim=1)
+
+                y_true.extend(labels.numpy())
+                y_pred.extend(predictions.cpu().numpy())
+
+        if self.config.binary_classification:
+            return MetricsCalculator.binary_metrics(y_true,y_pred)
+
+        return MetricsCalculator.multiclass_metrics(y_true,y_pred)
 
 # =============================================================
 # GRAD-CAM
@@ -726,7 +820,7 @@ class GradCAMProcessor:
         return visualization
 
 # =============================================================
-# ! INTERFACE GRÁFICA
+# INTERFACE GRÁFICA
 # =============================================================
 
 class TkinterLogHandler(logging.Handler):
@@ -898,7 +992,6 @@ class GUI(tk.Tk):
         return self.sidebar_frame
 
     def build_sidebar_for_training(self) -> None:
-        """Sidebar com controles existentes de treinamento."""
         panel = self.clear_sidebar()
         ttk.Label(panel, text="Treinamento", font=("TkDefaultFont", 11, "bold")).grid(row=0, column=0, sticky="w")
 
@@ -1163,7 +1256,6 @@ class GUI(tk.Tk):
         val_loss: float,
         val_acc: float,
     ) -> None:
-        """Atualiza o progresso de treino na interface."""
         percent = int((epoch / total_epochs) * 100)
         self.after(0, lambda: self.training_progress_bar.config(value=percent))
         self.after(
@@ -1174,7 +1266,6 @@ class GUI(tk.Tk):
         )
 
     def render_training_history(self) -> None:
-        """Desenha os gráficos de loss e acurácia ao final do treino."""
         if not self.training_manager:
             return
 
@@ -1234,7 +1325,6 @@ class GUI(tk.Tk):
         canvas.create_text(width - margin, height - margin + 26, anchor="ne", text="Validação", fill="#ff6600")
 
     def load_existing_model(self) -> None:
-        """Carrega um modelo treinado para ser usado na classificação."""
         path = filedialog.askopenfilename(
             filetypes=[("PyTorch model", "*.pth")],
             initialdir=str(Path("models").resolve())
@@ -1276,7 +1366,6 @@ class GUI(tk.Tk):
             messagebox.showerror("Erro", str(exc))
 
     def classify_current_image(self) -> None:
-        """Classifica a imagem carregada usando o modelo disponível."""
         if self.current_image is None:
             messagebox.showinfo("Classificação", "Abra uma imagem para classificar.")
             return
@@ -1466,88 +1555,9 @@ class GUI(tk.Tk):
 # MAIN
 # =============================================================
 
-# def main():
-#     app = GUI()
-#     app.mainloop()
-
-import argparse
-import matplotlib.pyplot as plt
-import numpy as np
-from pathlib import Path
-
-
-def load_single_image(path: Path) -> np.ndarray:
-    image = Image.open(path)
-
-    if image.mode != "L":
-        image = image.convert("L")
-
-    return np.array(image)
-
-
-def preprocess(image: np.ndarray, config: DatasetConfig) -> np.ndarray:
-    if config.segmented:
-        _, image = SegmentationProcessor.segment(
-            image,
-            config.segmentation_config
-        )
-
-    image = ImageManager.resize(image, config.image_size, config.image_size)
-    image = ImageManager.normalize(image)
-
-    return image
-
-
-def show_rotations_from_path(image_path: str):
-    path = Path(image_path)
-
-    if not path.exists():
-        raise FileNotFoundError(f"Imagem não encontrada: {path}")
-
-    # config igual ao dataset
-    config = DatasetConfig(
-        segmented=True,
-        augmentation=False,
-        image_size=224,
-        segmentation_config=SegmentationConfig()
-    )
-
-    print(f"📷 Carregando imagem: {path}")
-
-    image = load_single_image(path)
-
-    rotations = DataAugmentationProcessor.ROTATIONS
-
-    plt.figure(figsize=(12, 3))
-
-    rotated_imgs = DataAugmentationProcessor.generate(image)
-    for i, img in enumerate(rotated_imgs):
-        processed_img = preprocess(img, config)
-        rgb = np.stack([processed_img] * 3, axis=-1)
-
-        plt.subplot(1, len(rotations), i + 1)
-        plt.imshow(rgb, cmap="gray")
-        # plt.title(f"{angle}°")
-        plt.axis("off")
-
-    plt.tight_layout()
-    plt.show()
-
-
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--image", type=str, help="Caminho da imagem para testar rotações")
-    parser.add_argument("--gui", action="store_true", help="Inicia a interface gráfica")
-
-    args = parser.parse_args()
-
-    if args.image:
-        show_rotations_from_path(args.image)
-        return
-
     app = GUI()
     app.mainloop()
-
 
 if __name__ == "__main__":
     main()
