@@ -1,5 +1,6 @@
 import re
 import queue
+import threading
 import torch
 import logging
 import numpy as np
@@ -98,6 +99,16 @@ class DatasetConfig:
     binary_classification: bool = True
     image_size: int = 224
     segmentation_config: SegmentationConfig = field(default_factory=SegmentationConfig)
+
+@dataclass(slots=True)
+class TrainingConfig:
+    """Configuração de treino para o ciclo de treinamento do modelo."""
+    model_type: ModelType = ModelType.RESNET18
+    epochs: int = 10
+    batch_size: int = 16
+    learning_rate: float = 0.001
+    binary_classification: bool = True
+    model_path: Path = Path("model.pth")
 
 # =============================================================
 # DATASET MANAGER
@@ -414,6 +425,11 @@ class DataAugmentationProcessor:
 
         return rotated.astype(image.dtype)
 
+    @staticmethod
+    def generate(image: np.ndarray) -> list[np.ndarray]:
+        """Gera imagens rotacionadas para aumentar o conjunto de dados."""
+        return [DataAugmentationProcessor.rotate(image, angle) for angle in DataAugmentationProcessor.ROTATIONS]
+
 # =============================================================
 # TRANSFORMAÇÃO
 # =============================================================
@@ -490,20 +506,188 @@ class MammographyDataset(Dataset):
 # =============================================================
 
 class TrainingManager:
-    def train(self):
-        pass
+    """Gerencia o ciclo de treino, validação e persistência do modelo."""
 
-    def train_epoch(self):
-        pass
+    def __init__(
+        self,
+        train_dataset: MammographyDataset,
+        test_dataset: MammographyDataset,
+        config: TrainingConfig,
+        progress_callback: Callable[[int, int, float, float, float, float], None] | None = None
+    ):
+        self.config = config
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.progress_callback = progress_callback
 
-    def validate(self):
-        pass
+        self.train_loader = DataLoader(
+            train_dataset,
+            batch_size=config.batch_size,
+            shuffle=True,
+            pin_memory=torch.cuda.is_available(),
+            num_workers=2
+        )
 
-    def save_model(self):
-        pass
+        self.test_loader = DataLoader(
+            test_dataset,
+            batch_size=config.batch_size,
+            shuffle=False,
+            pin_memory=torch.cuda.is_available(),
+            num_workers=2
+        )
 
-    def load_model(self):
-        pass
+        self.model = self._create_model()
+        self.criterion = nn.CrossEntropyLoss()
+        self.optimizer = torch.optim.Adam(
+            self.model.parameters(),
+            lr=config.learning_rate
+        )
+
+        self.history: dict[str, list[float]] = {
+            "train_loss": [],
+            "train_accuracy": [],
+            "val_loss": [],
+            "val_accuracy": []
+        }
+
+        self.cancel_requested = False
+
+    def _create_model(self) -> nn.Module:
+        """Cria o modelo e adapta a última camada para o número de classes."""
+        num_classes = 2 if self.config.binary_classification else 4
+
+        if self.config.model_type == ModelType.RESNET18:
+            model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
+            model.fc = nn.Linear(model.fc.in_features, num_classes)
+
+        elif self.config.model_type == ModelType.EFFICIENTNET_B0:
+            model = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.DEFAULT)
+            model.classifier[1] = nn.Linear(model.classifier[1].in_features, num_classes)
+
+        else:
+            raise ValueError(f"Modelo não suportado: {self.config.model_type}")
+
+        return model.to(self.device)
+
+    def train_epoch(self) -> tuple[float, float]:
+        """Executa uma única época de treino e retorna loss e acurácia."""
+        self.model.train()
+
+        total_loss = 0.0
+        correct = 0
+        total = 0
+
+        for images, labels in self.train_loader:
+            if self.cancel_requested:
+                break
+
+            images = images.to(self.device, non_blocking=True)
+            labels = labels.to(self.device, non_blocking=True)
+
+            self.optimizer.zero_grad()
+            outputs = self.model(images)
+            loss = self.criterion(outputs, labels)
+            loss.backward()
+            self.optimizer.step()
+
+            total_loss += loss.item() * labels.size(0)
+            predictions = outputs.argmax(dim=1)
+            correct += (predictions == labels).sum().item()
+            total += labels.size(0)
+
+        if total == 0:
+            return 0.0, 0.0
+
+        return total_loss / total, correct / total
+
+    def validate(self) -> tuple[float, float]:
+        """Avalia o modelo no conjunto de validação."""
+        self.model.eval()
+
+        total_loss = 0.0
+        correct = 0
+        total = 0
+
+        with torch.no_grad():
+            for images, labels in self.test_loader:
+                if self.cancel_requested:
+                    break
+
+                images = images.to(self.device, non_blocking=True)
+                labels = labels.to(self.device, non_blocking=True)
+
+                outputs = self.model(images)
+                loss = self.criterion(outputs, labels)
+
+                total_loss += loss.item() * labels.size(0)
+                predictions = outputs.argmax(dim=1)
+                correct += (predictions == labels).sum().item()
+                total += labels.size(0)
+
+        if total == 0:
+            return 0.0, 0.0
+
+        return total_loss / total, correct / total
+
+    def train(self) -> dict[str, list[float]]:
+        """Realiza o treino completo e registra métricas por época."""
+        for epoch in range(1, self.config.epochs + 1):
+            if self.cancel_requested:
+                LOGGER.warning("Treinamento cancelado na época %d.", epoch)
+                break
+
+            train_loss, train_acc = self.train_epoch()
+            val_loss, val_acc = self.validate()
+
+            self.history["train_loss"].append(train_loss)
+            self.history["train_accuracy"].append(train_acc)
+            self.history["val_loss"].append(val_loss)
+            self.history["val_accuracy"].append(val_acc)
+
+            if self.progress_callback is not None:
+                self.progress_callback(
+                    epoch,
+                    self.config.epochs,
+                    train_loss,
+                    train_acc,
+                    val_loss,
+                    val_acc,
+                )
+
+            LOGGER.info(
+                "Época %d/%d | Treino loss %.4f | Treino acc %.4f | Val loss %.4f | Val acc %.4f",
+                epoch,
+                self.config.epochs,
+                train_loss,
+                train_acc,
+                val_loss,
+                val_acc
+            )
+
+        return self.history
+
+    def save_model(self, path: Path | None = None) -> None:
+        """Salva o estado do modelo em disco."""
+        path = path or self.config.model_path
+        torch.save(self.model.state_dict(), path)
+        LOGGER.info("Modelo salvo em %s", path)
+
+    def load_model(self, path: Path | None = None) -> None:
+        """Carrega o estado do modelo a partir de disco."""
+        path = path or self.config.model_path
+        self.model.load_state_dict(torch.load(path, map_location=self.device))
+        self.model.eval()
+        LOGGER.info("Modelo carregado de %s", path)
+
+    def predict(self, image_tensor: torch.Tensor) -> tuple[int, torch.Tensor]:
+        """Realiza inferência de uma imagem preparada e retorna classe e probabilidades."""
+        self.model.eval()
+
+        with torch.no_grad():
+            outputs = self.model(image_tensor.to(self.device))
+            probabilities = torch.softmax(outputs, dim=1)[0].cpu()
+            prediction = int(probabilities.argmax(dim=0).item())
+
+        return prediction, probabilities
 
 # =============================================================
 # GRAD-CAM
@@ -560,6 +744,8 @@ class GUI(tk.Tk):
         self.title("PAI - Segmentação e Classificação Mamográfica")
         self.dataset_dir: Path | None = None
         self.dataset_manager: DatasetManager = DatasetManager()
+        self.training_manager: TrainingManager | None = None
+        self.training_thread: threading.Thread | None = None
         self.current_sample: Sample | None = None
         self.current_image: np.ndarray | None = None
         self.current_display: Image.Image | None = None
@@ -585,6 +771,7 @@ class GUI(tk.Tk):
         self.lr_var = tk.DoubleVar(value=0.001)
 
         self.build_layout()
+        self.set_training_buttons_state(True)
         self._setup_logging_handler()
         self.after(200, self.flush_messages)
 
@@ -739,11 +926,20 @@ class GUI(tk.Tk):
         ttk.Entry(panel, textvariable=self.lr_var).grid(row=14, column=0, sticky="ew")
 
         ttk.Separator(panel).grid(row=15, column=0, sticky="ew", pady=10)
-        ttk.Button(panel, text="Treinar dataset/modelo").grid(row=16, column=0, sticky="ew", pady=3)
-        ttk.Button(panel, text="Cancelar treinamento").grid(row=17, column=0, sticky="ew", pady=3)
-        ttk.Button(panel, text="Exportar modelo treinado").grid(row=18, column=0, sticky="ew", pady=3)
+        self.start_training_button = ttk.Button(panel, text="Treinar dataset/modelo", command=self.start_training)
+        self.start_training_button.grid(row=16, column=0, sticky="ew", pady=3)
+        self.cancel_training_button = ttk.Button(panel, text="Cancelar treinamento", command=self.cancel_training)
+        self.cancel_training_button.grid(row=17, column=0, sticky="ew", pady=3)
+        self.export_model_button = ttk.Button(panel, text="Exportar modelo treinado", command=self.export_trained_model)
+        self.export_model_button.grid(row=18, column=0, sticky="ew", pady=3)
 
-        ttk.Separator(panel).grid(row=19, column=0, sticky="ew", pady=10)
+        ttk.Label(panel, text="Progresso de treino").grid(row=19, column=0, sticky="w", pady=(10, 0))
+        self.training_progress_bar = ttk.Progressbar(panel, maximum=100)
+        self.training_progress_bar.grid(row=20, column=0, sticky="ew", pady=4)
+        self.training_status_label = ttk.Label(panel, text="Aguardando treino...")
+        self.training_status_label.grid(row=21, column=0, sticky="w")
+
+        ttk.Separator(panel).grid(row=22, column=0, sticky="ew", pady=10)
 
     def build_sidebar_for_classification(self) -> None:
         panel = self.clear_sidebar()
@@ -760,40 +956,42 @@ class GUI(tk.Tk):
         ttk.Button(panel, text="Zoom 100%", command=self.reset_zoom).grid(row=5, column=0, sticky="ew", pady=3)
 
         ttk.Separator(panel).grid(row=6, column=0, sticky="ew", pady=8)
-        # ttk.Button(panel, text="Classificar", command=self.classify_current_image).grid(row=7, column=0, sticky="ew", pady=3)
+        ttk.Button(panel, text="Carregar modelo para classificação", command=self.load_existing_model).grid(row=7, column=0, sticky="ew", pady=3)
+        self.classify_button = ttk.Button(panel, text="Classificar imagem", command=self.classify_current_image, state="disabled")
+        self.classify_button.grid(row=8, column=0, sticky="ew", pady=3)
 
-        ttk.Separator(panel).grid(row=8, column=0, sticky="ew", pady=8)
+        ttk.Separator(panel).grid(row=9, column=0, sticky="ew", pady=8)
 
-        ttk.Label(panel, text="Threshold Offset").grid(row=9, column=0, sticky="w")
+        ttk.Label(panel, text="Threshold Offset").grid(row=10, column=0, sticky="w")
         ttk.Spinbox(
             panel,
             from_=-50,
             to=50,
             textvariable=self.threshold_offset_var
-        ).grid(row=10, column=0, sticky="ew")
+        ).grid(row=11, column=0, sticky="ew")
 
-        ttk.Label(panel, text="Closing Iterations").grid(row=11, column=0, sticky="w")
+        ttk.Label(panel, text="Closing Iterations").grid(row=12, column=0, sticky="w")
         ttk.Spinbox(
             panel,
             from_=1,
             to=10,
             textvariable=self.closing_iterations_var
-        ).grid(row=12, column=0, sticky="ew")
+        ).grid(row=13, column=0, sticky="ew")
 
-        ttk.Label(panel, text="Kernel Size").grid(row=13, column=0, sticky="w")
+        ttk.Label(panel, text="Kernel Size").grid(row=14, column=0, sticky="w")
         ttk.Spinbox(
             panel,
             from_=3,
             to=15,
             increment=2,
             textvariable=self.kernel_size_var
-        ).grid(row=14, column=0, sticky="ew")
+        ).grid(row=15, column=0, sticky="ew")
 
         ttk.Checkbutton(
             panel,
             text="Crop ROI",
             variable=self.crop_var
-        ).grid(row=15, column=0, sticky="w")
+        ).grid(row=16, column=0, sticky="w")
 
     @staticmethod
     def draw_placeholder(canvas: tk.Canvas, text: str) -> None:
@@ -817,9 +1015,339 @@ class GUI(tk.Tk):
         self.dataset_manager.load_dataset(dataset_dir)
 
     def choose_dataset(self) -> None:
-        directory = filedialog.askdirectory(initialdir=str(self.dataset_dir if self.dataset_dir.exists() else Path.cwd()))
+        directory = filedialog.askdirectory(initialdir=str(self.dataset_dir if self.dataset_dir and self.dataset_dir.exists() else Path.cwd()))
         if directory:
             self.load_dataset(Path(directory))
+
+    def create_training_config(self) -> TrainingConfig:
+        """Gera a configuração de treino a partir dos controles da interface."""
+        model_type = ModelType(self.model_var.get())
+        binary = self.task_var.get() == "binary"
+        model_folder = Path("models")
+        model_folder.mkdir(parents=True, exist_ok=True)
+
+        model_path = model_folder / f"{model_type.value}_{self.task_var.get()}.pth"
+
+        return TrainingConfig(
+            model_type=model_type,
+            epochs=self.epochs_var.get(),
+            batch_size=self.batch_var.get(),
+            learning_rate=self.lr_var.get(),
+            binary_classification=binary,
+            model_path=model_path
+        )
+
+    def create_dataset_config(self) -> DatasetConfig:
+        """Gera a configuração de dataset a partir da interface."""
+        return DatasetConfig(
+            segmented=self.segmented_var.get(),
+            augmentation=True,
+            binary_classification=self.task_var.get() == "binary",
+            image_size=224,
+            segmentation_config=SegmentationConfig(
+                threshold_offset=self.threshold_offset_var.get(),
+                closing_iterations=self.closing_iterations_var.get(),
+                kernel_size=self.kernel_size_var.get(),
+                crop=self.crop_var.get()
+            )
+        )
+
+    def start_training(self) -> None:
+        """Inicia o treinamento em segundo plano para não travar o GUI."""
+        if not self.ensure_records():
+            return
+
+        if self.training_thread and self.training_thread.is_alive():
+            messagebox.showinfo("Treinamento", "Um treinamento já está em execução.")
+            return
+
+        try:
+            dataset_config = self.create_dataset_config()
+            test_config = DatasetConfig(
+                segmented=dataset_config.segmented,
+                augmentation=False,
+                binary_classification=dataset_config.binary_classification,
+                image_size=dataset_config.image_size,
+                segmentation_config=dataset_config.segmentation_config
+            )
+
+            train_dataset = MammographyDataset(self.dataset_manager.train_samples, dataset_config)
+            test_dataset = MammographyDataset(self.dataset_manager.test_samples, test_config)
+
+            if len(train_dataset) == 0 or len(test_dataset) == 0:
+                messagebox.showinfo(
+                    "Treinamento",
+                    "O dataset precisa conter amostras de treino e teste. Verifique o conjunto carregado."
+                )
+                return
+
+            config = self.create_training_config()
+            self.training_manager = TrainingManager(
+                train_dataset,
+                test_dataset,
+                config,
+                progress_callback=self.update_training_progress
+            )
+            self.training_manager.cancel_requested = False
+
+            self.training_progress_bar["value"] = 0
+            self.training_status_label.config(text="Preparando treino...")
+            self.set_training_buttons_state(False)
+            self.log_message("Iniciando treinamento em segundo plano...")
+
+            self.training_thread = threading.Thread(
+                target=self._run_training,
+                args=(self.training_manager,),
+                daemon=True
+            )
+            self.training_thread.start()
+
+        except Exception as exc:
+            LOGGER.error("Erro ao iniciar treinamento: %s", exc)
+            messagebox.showerror("Erro", str(exc))
+            self.set_training_buttons_state(True)
+
+    def _run_training(self, manager: TrainingManager) -> None:
+        try:
+            manager.train()
+            manager.save_model()
+            self.log_message("Treinamento finalizado e modelo salvo com sucesso.")
+            self.after(0, self.render_training_history)
+        except Exception as exc:
+            LOGGER.error("Erro durante treinamento: %s", exc)
+            self.after(0, lambda: messagebox.showerror("Erro", str(exc)))
+        finally:
+            self.after(0, lambda: self.set_training_buttons_state(True))
+
+    def cancel_training(self) -> None:
+        if not self.training_manager:
+            return
+
+        self.training_manager.cancel_requested = True
+        self.log_message("Solicitação de cancelamento enviada. O treinamento será interrompido após a etapa atual.")
+
+    def export_trained_model(self) -> None:
+        if not self.training_manager:
+            messagebox.showinfo("Exportar modelo", "Nenhum modelo treinado disponível. Treine um modelo primeiro.")
+            return
+
+        path = filedialog.asksaveasfilename(
+            defaultextension=".pth",
+            filetypes=[("PyTorch model", "*.pth")],
+            initialfile=self.training_manager.config.model_path.name,
+            initialdir=str(self.training_manager.config.model_path.parent)
+        )
+
+        if not path:
+            return
+
+        try:
+            self.training_manager.save_model(Path(path))
+            messagebox.showinfo("Exportar modelo", f"Modelo exportado para {path}")
+        except Exception as exc:
+            LOGGER.error("Erro ao exportar modelo: %s", exc)
+            messagebox.showerror("Erro", str(exc))
+
+    def set_training_buttons_state(self, enabled: bool) -> None:
+        if hasattr(self, "start_training_button") and hasattr(self, "cancel_training_button") and hasattr(self, "export_model_button"):
+            self.start_training_button.config(state="normal" if enabled else "disabled")
+            self.cancel_training_button.config(state="normal" if not enabled else "disabled")
+            self.export_model_button.config(state="normal" if enabled else "disabled")
+
+    def update_training_progress(
+        self,
+        epoch: int,
+        total_epochs: int,
+        train_loss: float,
+        train_acc: float,
+        val_loss: float,
+        val_acc: float,
+    ) -> None:
+        """Atualiza o progresso de treino na interface."""
+        percent = int((epoch / total_epochs) * 100)
+        self.after(0, lambda: self.training_progress_bar.config(value=percent))
+        self.after(
+            0,
+            lambda: self.training_status_label.config(
+                text=f"Época {epoch}/{total_epochs} | loss {train_loss:.4f} | acc {train_acc:.4f} | val {val_acc:.4f}"
+            ),
+        )
+
+    def render_training_history(self) -> None:
+        """Desenha os gráficos de loss e acurácia ao final do treino."""
+        if not self.training_manager:
+            return
+
+        history = self.training_manager.history
+        self._draw_training_history_chart(
+            self.graph_canvases[0],
+            history["train_loss"],
+            history["val_loss"],
+            "Loss"
+        )
+        self._draw_training_history_chart(
+            self.graph_canvases[1],
+            history["train_accuracy"],
+            history["val_accuracy"],
+            "Acurácia"
+        )
+
+    def _draw_training_history_chart(
+        self,
+        canvas: tk.Canvas,
+        train_values: list[float],
+        val_values: list[float],
+        title: str,
+    ) -> None:
+        canvas.delete("all")
+        width = max(canvas.winfo_width(), 1)
+        height = max(canvas.winfo_height(), 1)
+
+        if not train_values:
+            canvas.create_text(width / 2, height / 2, text="Sem dados", fill="#777777")
+            return
+
+        margin = 30
+        chart_width = width - margin * 2
+        chart_height = height - margin * 2
+        max_val = max(train_values + val_values) if train_values or val_values else 1.0
+        min_val = min(train_values + val_values) if train_values or val_values else 0.0
+        value_range = max(max_val - min_val, 1e-6)
+
+        canvas.create_text(width / 2, margin / 2, text=title, fill="#333333", font=("TkDefaultFont", 11, "bold"))
+        canvas.create_rectangle(margin, margin, width - margin, height - margin, outline="#cccccc")
+
+        def coord(index: int, value: float) -> tuple[float, float]:
+            x = margin + (chart_width * index / max(len(train_values), len(val_values), 1))
+            y = margin + chart_height - ((value - min_val) / value_range) * chart_height
+            return x, y
+
+        train_points = [coord(i, v) for i, v in enumerate(train_values)]
+        val_points = [coord(i, v) for i, v in enumerate(val_values)]
+
+        if len(train_points) > 1:
+            canvas.create_line(*sum(train_points, ()), fill="#007acc", width=2, smooth=True)
+        if len(val_points) > 1:
+            canvas.create_line(*sum(val_points, ()), fill="#ff6600", width=2, smooth=True)
+
+        canvas.create_text(width - margin, height - margin + 12, anchor="ne", text="Treino", fill="#007acc")
+        canvas.create_text(width - margin, height - margin + 26, anchor="ne", text="Validação", fill="#ff6600")
+
+    def load_existing_model(self) -> None:
+        """Carrega um modelo treinado para ser usado na classificação."""
+        path = filedialog.askopenfilename(
+            filetypes=[("PyTorch model", "*.pth")],
+            initialdir=str(Path("models").resolve())
+        )
+
+        if not path:
+            return
+
+        model_config = self.create_training_config()
+        dataset_config = DatasetConfig(
+            segmented=self.segmented_var.get(),
+            augmentation=False,
+            binary_classification=self.task_var.get() == "binary",
+            image_size=224,
+            segmentation_config=SegmentationConfig(
+                threshold_offset=self.threshold_offset_var.get(),
+                closing_iterations=self.closing_iterations_var.get(),
+                kernel_size=self.kernel_size_var.get(),
+                crop=self.crop_var.get()
+            )
+        )
+
+        train_dataset = MammographyDataset(self.dataset_manager.train_samples, dataset_config)
+        test_dataset = MammographyDataset(self.dataset_manager.test_samples, dataset_config)
+
+        self.training_manager = TrainingManager(
+            train_dataset,
+            test_dataset,
+            model_config,
+            progress_callback=self.update_training_progress,
+        )
+
+        try:
+            self.training_manager.load_model(Path(path))
+            self.log_message(f"Modelo carregado de {path}")
+            self.classify_button.config(state="normal")
+        except Exception as exc:
+            LOGGER.error("Erro ao carregar modelo: %s", exc)
+            messagebox.showerror("Erro", str(exc))
+
+    def classify_current_image(self) -> None:
+        """Classifica a imagem carregada usando o modelo disponível."""
+        if self.current_image is None:
+            messagebox.showinfo("Classificação", "Abra uma imagem para classificar.")
+            return
+
+        if not self.training_manager:
+            messagebox.showinfo("Classificação", "Carregue um modelo ou treine um modelo primeiro.")
+            return
+
+        config = DatasetConfig(
+            segmented=self.segmented_var.get(),
+            augmentation=False,
+            binary_classification=self.task_var.get() == "binary",
+            image_size=224,
+            segmentation_config=SegmentationConfig(
+                threshold_offset=self.threshold_offset_var.get(),
+                closing_iterations=self.closing_iterations_var.get(),
+                kernel_size=self.kernel_size_var.get(),
+                crop=self.crop_var.get()
+            )
+        )
+
+        processed_image = self.current_image.copy()
+        if config.segmented:
+            _, processed_image = SegmentationProcessor.segment(processed_image, config.segmentation_config)
+
+        processed_image = ImageManager.resize(processed_image, config.image_size, config.image_size)
+        processed_image = ImageManager.normalize(processed_image)
+        processed_image = np.stack([processed_image] * 3, axis=-1)
+
+        image_tensor = torch.from_numpy(processed_image.transpose((2, 0, 1))).unsqueeze(0).float()
+
+        prediction, probabilities = self.training_manager.predict(image_tensor)
+
+        class_labels = [
+            "BIRADS I",
+            "BIRADS II",
+            "BIRADS III",
+            "BIRADS IV"
+        ]
+
+        if config.binary_classification:
+            label = "BIRADS I/II" if prediction == 0 else "BIRADS III/IV"
+            self.result_text.configure(state="normal")
+            self.result_text.delete("1.0", "end")
+            self.result_text.insert("end", f"Resultado binário: {label}\n")
+            self.result_text.insert("end", f"Confiança: {probabilities[prediction].item() * 100:.2f}%\n")
+            self.result_text.configure(state="disabled")
+
+            confidence_0 = probabilities[0].item() * 100
+            confidence_1 = probabilities[1].item() * 100
+            for label_name, value in zip(
+                ["BIRADS I", "BIRADS II", "BIRADS III", "BIRADS IV"],
+                [confidence_0, confidence_0, confidence_1, confidence_1]
+            ):
+                self.result_bars[label_name].config(value=value)
+                self.result_percent_labels[label_name].config(text=f"{value:.1f}%")
+        else:
+            label = class_labels[prediction]
+            self.result_text.configure(state="normal")
+            self.result_text.delete("1.0", "end")
+            self.result_text.insert("end", f"Resultado: {label}\n")
+            self.result_text.insert("end", "Probabilidades por classe:\n")
+            for index, class_name in enumerate(class_labels):
+                self.result_text.insert("end", f"  {class_name}: {probabilities[index].item() * 100:.2f}%\n")
+            self.result_text.configure(state="disabled")
+
+            for class_name, prob_value in zip(class_labels, probabilities.tolist()):
+                self.result_bars[class_name].config(value=prob_value * 100)
+                self.result_percent_labels[class_name].config(text=f"{prob_value * 100:.1f}%")
+
+        self.log_message(f"Classificação concluída: {label}")
 
     def open_image(self) -> None:
         filename = filedialog.askopenfilename(
@@ -1008,11 +1536,17 @@ def show_rotations_from_path(image_path: str):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--image", type=str, required=True, help="Caminho da imagem")
+    parser.add_argument("--image", type=str, help="Caminho da imagem para testar rotações")
+    parser.add_argument("--gui", action="store_true", help="Inicia a interface gráfica")
 
     args = parser.parse_args()
 
-    show_rotations_from_path(args.image)
+    if args.image:
+        show_rotations_from_path(args.image)
+        return
+
+    app = GUI()
+    app.mainloop()
 
 
 if __name__ == "__main__":
