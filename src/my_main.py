@@ -9,14 +9,14 @@ from pathlib import Path
 from scipy import ndimage
 from enum import Enum, StrEnum
 from rich.logging import RichHandler
+from pytorch_grad_cam import GradCAM
 from PIL import Image, ImageOps, ImageTk
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable
 from torchvision import models, transforms
 from tkinter import ttk, filedialog, messagebox
 from torch.utils.data import DataLoader, Dataset
-
-ROTATIONS = [-20, -10, 0, 10, 20]
+from pytorch_grad_cam.utils.image import show_cam_on_image
 
 # =============================================================
 # LOGGING
@@ -46,7 +46,7 @@ LOGGER.setLevel(LOG_LEVEL.value)
 LOGGER.propagate = False
 
 # =============================================================
-# ENUMS
+# ENUMS, CLASSES E CONFIGS
 # =============================================================
 
 class SetType(Enum):
@@ -66,10 +66,6 @@ class SampleBiradsClass(StrEnum):
     E = "BIRADS II"
     F = "BIRADS III"
     G = "BIRADS IV"
-
-# =============================================================
-# CLASSES
-# =============================================================
 
 @dataclass(frozen=True, slots=True)
 class Sample:
@@ -246,7 +242,7 @@ class ImageManager:
 
         pil_image = Image.fromarray(image)
 
-        pil_image = pil_image.resize((width, height))
+        pil_image = pil_image.resize((width, height), Image.Resampling.BILINEAR)
 
         return np.array(pil_image)
     
@@ -268,7 +264,6 @@ class ImageManager:
 # =============================================================
 
 class SegmentationProcessor:
-
     @staticmethod
     def otsu_threshold(image: np.ndarray) -> int:
         LOGGER.debug("Calculando threshold de Otsu...")
@@ -378,8 +373,11 @@ class SegmentationProcessor:
         ]
 
     @staticmethod
-    def segment(image: np.ndarray, config: SegmentationConfig = SegmentationConfig()) -> tuple[np.ndarray, np.ndarray]:
+    def segment(image: np.ndarray, config: SegmentationConfig = None) -> tuple[np.ndarray, np.ndarray]:
         LOGGER.debug("Segmentando imagem...")
+
+        if config is None:
+            config = SegmentationConfig()
 
         mask = SegmentationProcessor.create_mask(image, threshold_offset=config.threshold_offset)
 
@@ -401,7 +399,12 @@ class SegmentationProcessor:
 
         return mask, segmented
     
+# =============================================================
+# AUMENTO DE DADOS
+# =============================================================
+
 class DataAugmentationProcessor:
+    ROTATIONS = [-20, -10, 0, 10, 20]
     
     @staticmethod
     def rotate(image: np.ndarray, angle: float) -> np.ndarray:
@@ -411,16 +414,9 @@ class DataAugmentationProcessor:
 
         return rotated.astype(image.dtype)
 
-    @staticmethod
-    def generate(image: np.ndarray) -> list[np.ndarray]:
-        LOGGER.debug("Gerando imagens aumentadas por rotação...")
-
-        augmented_images = []
-
-        for angle in ROTATIONS:
-            augmented_images.append(DataAugmentationProcessor.rotate(image, angle))
-
-        return augmented_images
+# =============================================================
+# TRANSFORMAÇÃO
+# =============================================================
 
 class MammographyDataset(Dataset):
     BINARY_CLASS_MAPPING = {
@@ -446,21 +442,29 @@ class MammographyDataset(Dataset):
         LOGGER.info("Dataset criado com %d amostras", len(samples))
 
     def __len__(self):
-        return len(self.samples) * len(ROTATIONS)
+        if self.config.augmentation:
+            return len(self.samples) * len(DataAugmentationProcessor.ROTATIONS)
+        
+        return len(self.samples)
 
     def __getitem__(self, index):
-        sample_index = index // len(ROTATIONS)
-        rotation_index = index % len(ROTATIONS)
+        if self.config.augmentation:
+            sample_index = index // len(DataAugmentationProcessor.ROTATIONS)
+            rotation_index = index % len(DataAugmentationProcessor.ROTATIONS)
 
-        sample = self.samples[sample_index]
-        angle = ROTATIONS[rotation_index]
+            sample = self.samples[sample_index]
+            angle = DataAugmentationProcessor.ROTATIONS[rotation_index]
+        else:
+            sample = self.samples[index]
+            angle = 0
 
         image = ImageManager.load(sample)
 
         if self.config.segmented:
             _, image = SegmentationProcessor.segment(image, self.config.segmentation_config)
 
-        image = DataAugmentationProcessor.rotate(image, angle)
+        if angle != 0:
+            image = DataAugmentationProcessor.rotate(image, angle)
 
         image = ImageManager.resize(image, self.config.image_size, self.config.image_size)
         image = ImageManager.normalize(image)
@@ -481,6 +485,9 @@ class MammographyDataset(Dataset):
             return np.stack([image] * 3, axis=-1)
         return image
         
+# =============================================================
+# TREINAMENTO E CLASSIFICAÇÃO
+# =============================================================
 
 class TrainingManager:
     def train(self):
@@ -498,26 +505,41 @@ class TrainingManager:
     def load_model(self):
         pass
 
-class MetricsCalculator:
-
-    @staticmethod
-    def binary_metrics(y_true,y_pred):
-        pass
-
-    @staticmethod
-    def multiclass_metrics(y_true,y_pred):
-        pass
+# =============================================================
+# GRAD-CAM
+# =============================================================
 
 class GradCAMProcessor:
-
     def __init__(self, model: nn.Module):
-        pass
+        target_layer = self.get_target_layer(model)
+        self.cam = GradCAM(model=model, target_layers=[target_layer])
 
-    def generate(self, image: torch.Tensor) -> np.ndarray:
-        pass
+    @staticmethod
+    def get_target_layer(model: nn.Module) -> nn.Module:
+        if isinstance(model, models.ResNet):
+            return model.layer4[-1]
+
+        if isinstance(model, models.EfficientNet):
+            return model.features[-1]
+
+        raise ValueError(f"Modelo não suportado: {type(model)}")
+
+    def generate(self, image_tensor: torch.Tensor) -> np.ndarray:
+        grayscale_cam = self.cam(input_tensor=image_tensor)
+        return grayscale_cam[0]
 
     def overlay(self, image: np.ndarray, heatmap: np.ndarray) -> np.ndarray:
-        pass
+        image = image.astype(np.float32)
+        image -= image.min()
+
+        if image.max() > 0:
+            image /= image.max()
+
+        if image.ndim == 2:
+            image = np.stack([image] * 3, axis=-1)
+
+        visualization = show_cam_on_image(image, heatmap, use_rgb=True)
+        return visualization
 
 # =============================================================
 # ! INTERFACE GRÁFICA
@@ -966,7 +988,7 @@ def show_rotations_from_path(image_path: str):
 
     image = load_single_image(path)
 
-    rotations = ROTATIONS
+    rotations = DataAugmentationProcessor.ROTATIONS
 
     plt.figure(figsize=(12, 3))
 
