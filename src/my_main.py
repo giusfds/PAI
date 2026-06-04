@@ -16,6 +16,8 @@ from PIL import Image, ImageOps, ImageTk
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable
 from torchvision import models, transforms
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from tkinter import ttk, filedialog, messagebox
 from torch.utils.data import DataLoader, Dataset
 from pytorch_grad_cam.utils.image import show_cam_on_image
@@ -25,6 +27,7 @@ from sklearn.metrics import (
     recall_score,
     f1_score,
     confusion_matrix,
+    ConfusionMatrixDisplay,
     classification_report,
 )
 
@@ -848,6 +851,14 @@ class GUI(tk.Tk):
         self.image_canvases: dict[str, tk.Canvas] = {}
         self.result_bars: dict[str, ttk.Progressbar] = {}
         self.result_percent_labels: dict[str, ttk.Label] = {}
+        self.training_figures: dict[str, Figure] = {}
+        self.training_axes: dict[str, Any] = {}
+        self.training_plot_canvases: dict[str, FigureCanvasTkAgg] = {}
+        self.confusion_figure: Figure | None = None
+        self.confusion_axis: Any | None = None
+        self.confusion_canvas: FigureCanvasTkAgg | None = None
+        self.training_metric_labels: dict[str, ttk.Label] = {}
+        self.training_metrics_status_label: ttk.Label | None = None
         self.message_queue: queue.Queue[str] = queue.Queue()
         self.training_cancel_requested = False
 
@@ -870,7 +881,7 @@ class GUI(tk.Tk):
         self.after(200, self.flush_messages)
 
     def build_layout(self) -> None:
-        self.minsize(980, 640)
+        self.minsize(1180, 700)
         self.columnconfigure(1, weight=1)
         self.rowconfigure(0, weight=1)
 
@@ -893,8 +904,9 @@ class GUI(tk.Tk):
 
     def build_training_page(self) -> None:
         self.training_page.columnconfigure(0, weight=1)
-        self.training_page.rowconfigure(0, weight=3)
+        self.training_page.rowconfigure(0, weight=2)
         self.training_page.rowconfigure(1, weight=2)
+        self.training_page.rowconfigure(2, weight=1)
 
         graph_area = ttk.Frame(self.training_page)
         graph_area.grid(row=0, column=0, sticky="nsew")
@@ -902,19 +914,61 @@ class GUI(tk.Tk):
         graph_area.columnconfigure(1, weight=1)
         graph_area.rowconfigure(0, weight=1)
 
-        self.graph_canvases: list[tk.Canvas] = []
-        for column, title in enumerate(("grafico 1", "grafico 2")):
+        for column, (chart_key, title, ylabel) in enumerate((
+            ("loss", "Loss", "Loss"),
+            ("accuracy", "Acurácia", "Acurácia"),
+        )):
             frame = ttk.LabelFrame(graph_area, text=title, padding=8)
             frame.grid(row=0, column=column, sticky="nsew", padx=(0, 6) if column == 0 else (6, 0))
             frame.rowconfigure(0, weight=1)
             frame.columnconfigure(0, weight=1)
-            canvas = tk.Canvas(frame, background="#f5f5f5", highlightthickness=1, highlightbackground="#cccccc")
-            canvas.grid(row=0, column=0, sticky="nsew")
-            canvas.bind("<Configure>", lambda _event, item=canvas, label=title: self.draw_placeholder(item, label))
-            self.graph_canvases.append(canvas)
+            figure = Figure(figsize=(4.2, 2.6), dpi=100)
+            axis = figure.add_subplot(111)
+            canvas = FigureCanvasTkAgg(figure, master=frame)
+            canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+            self.training_figures[chart_key] = figure
+            self.training_axes[chart_key] = axis
+            self.training_plot_canvases[chart_key] = canvas
+            self._draw_training_history_chart(chart_key, [], [], title, ylabel)
+
+        analytics_area = ttk.Frame(self.training_page)
+        analytics_area.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
+        analytics_area.columnconfigure(0, weight=3)
+        analytics_area.columnconfigure(1, weight=2)
+        analytics_area.rowconfigure(0, weight=1)
+
+        confusion_frame = ttk.LabelFrame(analytics_area, text="Matriz de confusão", padding=8)
+        confusion_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        confusion_frame.rowconfigure(0, weight=1)
+        confusion_frame.columnconfigure(0, weight=1)
+        self.confusion_figure = Figure(figsize=(4.8, 2.8), dpi=100)
+        self.confusion_axis = self.confusion_figure.add_subplot(111)
+        self.confusion_canvas = FigureCanvasTkAgg(self.confusion_figure, master=confusion_frame)
+        self.confusion_canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+        self.render_confusion_matrix(None)
+
+        metrics_frame = ttk.LabelFrame(analytics_area, text="Métricas finais", padding=10)
+        metrics_frame.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+        metrics_frame.columnconfigure(1, weight=1)
+        self.training_metrics_status_label = ttk.Label(metrics_frame, text="Aguardando avaliação.")
+        self.training_metrics_status_label.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        metric_rows = (
+            ("accuracy", "Accuracy"),
+            ("precision", "Precision"),
+            ("sensitivity", "Sensitivity"),
+            ("specificity", "Specificity"),
+            ("f1", "F1"),
+            ("mean_sensitivity", "Sensibilidade média"),
+            ("mean_specificity", "Especificidade média"),
+        )
+        for row, (key, label) in enumerate(metric_rows, start=1):
+            ttk.Label(metrics_frame, text=label).grid(row=row, column=0, sticky="w", pady=2)
+            value_label = ttk.Label(metrics_frame, text="-", anchor="e")
+            value_label.grid(row=row, column=1, sticky="e", pady=2)
+            self.training_metric_labels[key] = value_label
 
         log_frame = ttk.LabelFrame(self.training_page, text="Logs", padding=8)
-        log_frame.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
+        log_frame.grid(row=2, column=0, sticky="nsew", pady=(10, 0))
         log_frame.rowconfigure(0, weight=1)
         log_frame.columnconfigure(0, weight=1)
         self.log = tk.Text(log_frame, height=10, wrap="word")
@@ -931,17 +985,18 @@ class GUI(tk.Tk):
         image_area = ttk.Frame(self.classification_page)
         image_area.grid(row=0, column=0, sticky="nsew")
         image_area.rowconfigure(0, weight=1)
-        for column in range(3):
-            image_area.columnconfigure(column, weight=1, uniform="classification_images")
-
         panel_specs = (
             ("original", "Imagem original"),
             ("mask", "Mascara"),
             ("segmented", "Imagem segmentada"),
+            ("gradcam", "Grad-CAM"),
         )
+        for column in range(len(panel_specs)):
+            image_area.columnconfigure(column, weight=1, uniform="classification_images")
+
         for column, (key, title) in enumerate(panel_specs):
             frame = ttk.LabelFrame(image_area, text=title, padding=8)
-            frame.grid(row=0, column=column, sticky="nsew", padx=self.panel_padding(column))
+            frame.grid(row=0, column=column, sticky="nsew", padx=self.panel_padding(column, len(panel_specs)))
             frame.rowconfigure(0, weight=1)
             frame.columnconfigure(0, weight=1)
             canvas = tk.Canvas(frame, background="#111111", highlightthickness=0)
@@ -971,12 +1026,12 @@ class GUI(tk.Tk):
             self.result_percent_labels[label] = percent_label
 
     @staticmethod
-    def panel_padding(column: int) -> tuple[int, int]:
+    def panel_padding(column: int, total_columns: int) -> tuple[int, int]:
         if column == 0:
             return (0, 6)
-        if column == 1:
-            return (6, 6)
-        return (6, 0)
+        if column == total_columns - 1:
+            return (6, 0)
+        return (6, 6)
 
     def on_tab_changed(self, _event: tk.Event | None = None) -> None:
         tab_text = self.notebook.tab(self.notebook.select(), "text")
@@ -1185,6 +1240,7 @@ class GUI(tk.Tk):
 
             self.training_progress_bar["value"] = 0
             self.training_status_label.config(text="Preparando treino...")
+            self.clear_training_outputs()
             self.set_training_buttons_state(False)
             self.log_message("Iniciando treinamento em segundo plano...")
 
@@ -1204,8 +1260,16 @@ class GUI(tk.Tk):
         try:
             manager.train()
             manager.save_model()
+            final_metrics = None
+            if not manager.cancel_requested:
+                try:
+                    final_metrics = manager.evaluate()
+                except Exception as exc:
+                    LOGGER.error("Erro ao calcular métricas finais: %s", exc)
+                    self.log_message(f"Erro ao calcular métricas finais: {exc}")
             self.log_message("Treinamento finalizado e modelo salvo com sucesso.")
             self.after(0, self.render_training_history)
+            self.after(0, lambda metrics=final_metrics: self.render_training_evaluation(metrics))
         except Exception as exc:
             LOGGER.error("Erro durante treinamento: %s", exc)
             self.after(0, lambda: messagebox.showerror("Erro", str(exc)))
@@ -1264,6 +1328,7 @@ class GUI(tk.Tk):
                 text=f"Época {epoch}/{total_epochs} | loss {train_loss:.4f} | acc {train_acc:.4f} | val {val_acc:.4f}"
             ),
         )
+        self.after(0, self.render_training_history)
 
     def render_training_history(self) -> None:
         if not self.training_manager:
@@ -1271,58 +1336,136 @@ class GUI(tk.Tk):
 
         history = self.training_manager.history
         self._draw_training_history_chart(
-            self.graph_canvases[0],
+            "loss",
             history["train_loss"],
             history["val_loss"],
+            "Loss",
             "Loss"
         )
         self._draw_training_history_chart(
-            self.graph_canvases[1],
+            "accuracy",
             history["train_accuracy"],
             history["val_accuracy"],
+            "Acurácia",
             "Acurácia"
         )
 
     def _draw_training_history_chart(
         self,
-        canvas: tk.Canvas,
+        chart_key: str,
         train_values: list[float],
         val_values: list[float],
         title: str,
+        ylabel: str,
     ) -> None:
-        canvas.delete("all")
-        width = max(canvas.winfo_width(), 1)
-        height = max(canvas.winfo_height(), 1)
-
-        if not train_values:
-            canvas.create_text(width / 2, height / 2, text="Sem dados", fill="#777777")
+        axis = self.training_axes.get(chart_key)
+        figure = self.training_figures.get(chart_key)
+        canvas = self.training_plot_canvases.get(chart_key)
+        if axis is None or figure is None or canvas is None:
             return
 
-        margin = 30
-        chart_width = width - margin * 2
-        chart_height = height - margin * 2
-        max_val = max(train_values + val_values) if train_values or val_values else 1.0
-        min_val = min(train_values + val_values) if train_values or val_values else 0.0
-        value_range = max(max_val - min_val, 1e-6)
+        axis.clear()
 
-        canvas.create_text(width / 2, margin / 2, text=title, fill="#333333", font=("TkDefaultFont", 11, "bold"))
-        canvas.create_rectangle(margin, margin, width - margin, height - margin, outline="#cccccc")
+        if not train_values:
+            axis.set_axis_off()
+            axis.text(0.5, 0.5, "Sem dados", ha="center", va="center", color="#777777")
+            figure.tight_layout()
+            canvas.draw_idle()
+            return
 
-        def coord(index: int, value: float) -> tuple[float, float]:
-            x = margin + (chart_width * index / max(len(train_values), len(val_values), 1))
-            y = margin + chart_height - ((value - min_val) / value_range) * chart_height
-            return x, y
+        train_epochs = np.arange(1, len(train_values) + 1)
+        axis.plot(train_epochs, train_values, marker="o", linewidth=2, label="Treino")
 
-        train_points = [coord(i, v) for i, v in enumerate(train_values)]
-        val_points = [coord(i, v) for i, v in enumerate(val_values)]
+        if val_values:
+            val_epochs = np.arange(1, len(val_values) + 1)
+            axis.plot(val_epochs, val_values, marker="o", linewidth=2, label="Validação")
 
-        if len(train_points) > 1:
-            canvas.create_line(*sum(train_points, ()), fill="#007acc", width=2, smooth=True)
-        if len(val_points) > 1:
-            canvas.create_line(*sum(val_points, ()), fill="#ff6600", width=2, smooth=True)
+        axis.set_title(title)
+        axis.set_xlabel("Época")
+        axis.set_ylabel(ylabel)
+        axis.grid(True, alpha=0.25)
+        axis.legend(loc="best")
 
-        canvas.create_text(width - margin, height - margin + 12, anchor="ne", text="Treino", fill="#007acc")
-        canvas.create_text(width - margin, height - margin + 26, anchor="ne", text="Validação", fill="#ff6600")
+        if chart_key == "accuracy":
+            all_values = train_values + val_values
+            upper_limit = max(1.0, max(all_values) * 1.05)
+            axis.set_ylim(0, upper_limit)
+
+        figure.tight_layout()
+        canvas.draw_idle()
+
+    def clear_training_outputs(self) -> None:
+        self._draw_training_history_chart("loss", [], [], "Loss", "Loss")
+        self._draw_training_history_chart("accuracy", [], [], "Acurácia", "Acurácia")
+        self.render_training_evaluation(None)
+
+    def render_training_evaluation(self, metrics: dict[str, Any] | None) -> None:
+        self.render_training_metrics(metrics)
+        self.render_confusion_matrix(metrics)
+
+    def render_training_metrics(self, metrics: dict[str, Any] | None) -> None:
+        for label in self.training_metric_labels.values():
+            label.config(text="-")
+
+        if self.training_metrics_status_label is None:
+            return
+
+        if not metrics:
+            self.training_metrics_status_label.config(text="Aguardando avaliação.")
+            return
+
+        self.training_metrics_status_label.config(text="Avaliação do conjunto de teste")
+        metric_values = {
+            "accuracy": metrics.get("accuracy"),
+            "precision": metrics.get("precision"),
+            "sensitivity": metrics.get("sensitivity"),
+            "specificity": metrics.get("specificity"),
+            "f1": metrics.get("f1"),
+            "mean_sensitivity": metrics.get("mean_sensitivity"),
+            "mean_specificity": metrics.get("mean_specificity"),
+        }
+
+        for key, value in metric_values.items():
+            label = self.training_metric_labels.get(key)
+            if label is not None and value is not None:
+                label.config(text=self.format_metric_value(value))
+
+    def render_confusion_matrix(self, metrics: dict[str, Any] | None) -> None:
+        if self.confusion_axis is None or self.confusion_figure is None or self.confusion_canvas is None:
+            return
+
+        self.confusion_axis.clear()
+        matrix = None if not metrics else metrics.get("confusion_matrix")
+        if matrix is None:
+            self.confusion_axis.set_axis_off()
+            self.confusion_axis.text(0.5, 0.5, "Matriz indisponível", ha="center", va="center", color="#777777")
+            self.confusion_figure.tight_layout()
+            self.confusion_canvas.draw_idle()
+            return
+
+        matrix = np.asarray(matrix)
+        labels = self.training_display_labels(matrix.shape[0])
+        display = ConfusionMatrixDisplay(confusion_matrix=matrix, display_labels=labels)
+        display.plot(ax=self.confusion_axis, cmap="Blues", colorbar=False, values_format="d")
+        self.confusion_axis.set_title("Matriz de Confusão")
+        self.confusion_axis.set_xlabel("Predito")
+        self.confusion_axis.set_ylabel("Real")
+        self.confusion_figure.tight_layout()
+        self.confusion_canvas.draw_idle()
+
+    def training_display_labels(self, class_count: int) -> list[str]:
+        if class_count == 2:
+            return ["I/II", "III/IV"]
+        if class_count == 4:
+            return ["I", "II", "III", "IV"]
+        return [str(index) for index in range(class_count)]
+
+    @staticmethod
+    def format_metric_value(value: Any) -> str:
+        try:
+            return f"{float(value) * 100:.1f}%"
+        except (TypeError, ValueError):
+            return "-"
 
     def load_existing_model(self) -> None:
         path = filedialog.askopenfilename(
@@ -1436,7 +1579,24 @@ class GUI(tk.Tk):
                 self.result_bars[class_name].config(value=prob_value * 100)
                 self.result_percent_labels[class_name].config(text=f"{prob_value * 100:.1f}%")
 
+        self.update_gradcam_panel(image_tensor, processed_image)
         self.log_message(f"Classificação concluída: {label}")
+
+    def update_gradcam_panel(self, image_tensor: torch.Tensor, base_image: np.ndarray) -> None:
+        if not self.training_manager:
+            self.set_classification_image("gradcam", None)
+            return
+
+        try:
+            gradcam_tensor = image_tensor.to(self.training_manager.device).requires_grad_(True)
+            gradcam = GradCAMProcessor(self.training_manager.model)
+            heatmap = gradcam.generate(gradcam_tensor)
+            overlay = gradcam.overlay(base_image, heatmap)
+            self.set_classification_image("gradcam", Image.fromarray(overlay.astype(np.uint8)))
+        except Exception as exc:
+            self.set_classification_image("gradcam", None)
+            LOGGER.error("Erro ao gerar Grad-CAM: %s", exc)
+            self.log_message(f"Grad-CAM indisponível: {exc}")
 
     def open_image(self) -> None:
         filename = filedialog.askopenfilename(
@@ -1477,6 +1637,7 @@ class GUI(tk.Tk):
             self.set_classification_image("original",image_pil)
             self.set_classification_image("mask",ImageManager.to_pil(mask * 255))
             self.set_classification_image("segmented",ImageManager.to_pil(segmented * 255))
+            self.set_classification_image("gradcam", None)
 
             self.zoom_var.set(1.0)
 
@@ -1492,7 +1653,7 @@ class GUI(tk.Tk):
         self.open_image()
 
     def refresh_image(self) -> None:
-        for name in ("original", "mask", "segmented"):
+        for name in ("original", "mask", "segmented", "gradcam"):
             self.render_classification_panel(name)
 
     def reset_zoom(self) -> None:
@@ -1520,6 +1681,7 @@ class GUI(tk.Tk):
                 "original": "Imagem original",
                 "mask": "Mascara",
                 "segmented": "Imagem segmentada",
+                "gradcam": "Grad-CAM",
             }
             canvas.create_text(width / 2, height / 2, text=labels.get(panel_name, panel_name), fill="#777777")
             return
