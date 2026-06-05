@@ -32,7 +32,7 @@ from sklearn.metrics import (
 )
 
 # =============================================================
-# LOGGING
+# ENUMS, CLASSES, CONFIGS e LOG
 # =============================================================
 
 _rich_handler = RichHandler(
@@ -58,10 +58,6 @@ LOGGER.addHandler(_rich_handler)
 LOGGER.setLevel(LOG_LEVEL.value)
 LOGGER.propagate = False
 
-# =============================================================
-# ENUMS, CLASSES E CONFIGS
-# =============================================================
-
 class SetType(Enum):
     TRAIN = "train"
     TEST = "test"
@@ -79,6 +75,8 @@ class SampleBiradsClass(StrEnum):
     E = "BIRADS II"
     F = "BIRADS III"
     G = "BIRADS IV"
+
+DEFAULT_BIRADS_LABELS = tuple(birads.value for birads in SampleBiradsClass)
 
 @dataclass(frozen=True, slots=True)
 class Sample:
@@ -119,8 +117,12 @@ class TrainingConfig:
     epochs: int = 8
     batch_size: int = 16
     learning_rate: float = 0.001
+    dropout_rate: float = 0.3
     binary_classification: bool = True
     model_path: Path = Path("model.pth")
+
+_DEFAULT_TRAINING_CONFIG = TrainingConfig()
+_DEFAULT_SEGMENTATION_CONFIG = SegmentationConfig()
 
 # =============================================================
 # DATASET MANAGER
@@ -390,10 +392,7 @@ class SegmentationProcessor:
         left = cols.min()
         right = cols.max()
 
-        return image[
-            top:bottom + 1,
-            left:right + 1
-        ]
+        return image[top:bottom + 1, left:right + 1]
 
     @staticmethod
     def segment(image: np.ndarray, config: SegmentationConfig = None) -> tuple[np.ndarray, np.ndarray]:
@@ -509,7 +508,7 @@ class MammographyDataset(Dataset):
         return image
         
 # =============================================================
-# TREINAMENTO E CLASSIFICAÇÃO
+# TREINAMENTO, CLASSIFICAÇÃO E AVALIAÇÃO
 # =============================================================
 
 class MetricsCalculator:
@@ -554,14 +553,14 @@ class MetricsCalculator:
 class TrainingManager:
     def __init__(
         self,
-        train_dataset: MammographyDataset,
-        test_dataset: MammographyDataset,
-        config: TrainingConfig,
-        progress_callback: Callable[[int, int, float, float, float, float], None] | None = None
+        train_dataset: MammographyDataset,  test_dataset: MammographyDataset, config: TrainingConfig,
+        progress_callback: Callable[[int, int, float, float, float, float], None] | None = None,
+        batch_progress_callback: Callable[[int, int, int, int], None] | None = None,
     ):
         self.config = config
         self.device = self._get_device()
         self.progress_callback = progress_callback
+        self.batch_progress_callback = batch_progress_callback
 
         self.train_loader = DataLoader(
             train_dataset,
@@ -602,57 +601,66 @@ class TrainingManager:
 
     def _create_model(self) -> nn.Module:
         num_classes = 2 if self.config.binary_classification else 4
+        dropout_rate = float(self.config.dropout_rate)
 
         if self.config.model_type == ModelType.RESNET18:
             model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
             for param in model.parameters():
                 param.requires_grad = False
-            model.fc = nn.Linear(model.fc.in_features, num_classes)
+            model.fc = nn.Sequential(nn.Dropout(p=dropout_rate), nn.Linear(model.fc.in_features, num_classes))
             self.trainable_parameters = model.fc.parameters()
 
         elif self.config.model_type == ModelType.EFFICIENTNET_B0:
             model = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.DEFAULT)
             for param in model.parameters():
                 param.requires_grad = False
-            model.classifier[1] = nn.Linear(model.classifier[1].in_features, num_classes)
-            self.trainable_parameters = model.classifier[1].parameters()
+            in_features = model.classifier[1].in_features
+            model.classifier = nn.Sequential(nn.Dropout(p=dropout_rate), nn.Linear(in_features, num_classes))
+            self.trainable_parameters = model.classifier.parameters()
 
         elif self.config.model_type == ModelType.EFFICIENTNET_B1:
             model = models.efficientnet_b1(weights=models.EfficientNet_B1_Weights.DEFAULT)
             for param in model.parameters():
                 param.requires_grad = False
-            model.classifier[1] = nn.Linear(model.classifier[1].in_features, num_classes)
-            self.trainable_parameters = model.classifier[1].parameters()
+            in_features = model.classifier[1].in_features
+            model.classifier = nn.Sequential(nn.Dropout(p=dropout_rate), nn.Linear(in_features, num_classes))
+            self.trainable_parameters = model.classifier.parameters()
 
         elif self.config.model_type == ModelType.EFFICIENTNET_B2:
             model = models.efficientnet_b2(weights=models.EfficientNet_B2_Weights.DEFAULT)
             for param in model.parameters():
                 param.requires_grad = False
-            model.classifier[1] = nn.Linear(model.classifier[1].in_features, num_classes)
-            self.trainable_parameters = model.classifier[1].parameters()
+            in_features = model.classifier[1].in_features
+            model.classifier = nn.Sequential(nn.Dropout(p=dropout_rate), nn.Linear(in_features, num_classes))
+            self.trainable_parameters = model.classifier.parameters()
 
         elif self.config.model_type == ModelType.EFFICIENTNET_B3:
             model = models.efficientnet_b3(weights=models.EfficientNet_B3_Weights.DEFAULT)
             for param in model.parameters():
                 param.requires_grad = False
-            model.classifier[1] = nn.Linear(model.classifier[1].in_features, num_classes)
-            self.trainable_parameters = model.classifier[1].parameters()
+            in_features = model.classifier[1].in_features
+            model.classifier = nn.Sequential(nn.Dropout(p=dropout_rate), nn.Linear(in_features, num_classes))
+            self.trainable_parameters = model.classifier.parameters()
 
         else:
             raise ValueError(f"Modelo não suportado: {self.config.model_type}")
 
         return model.to(self.device)
 
-    def train_epoch(self) -> tuple[float, float]:
+    def train_epoch(self, epoch: int, total_epochs: int) -> tuple[float, float]:
         self.model.train()
 
         total_loss = 0.0
         correct = 0
         total = 0
+        total_batches = len(self.train_loader)
 
-        for images, labels in self.train_loader:
+        for batch_index, (images, labels) in enumerate(self.train_loader, start=1):
             if self.cancel_requested:
                 break
+
+            if self.batch_progress_callback is not None:
+                self.batch_progress_callback(epoch, total_epochs, batch_index, total_batches)
 
             images = images.to(self.device, non_blocking=True)
             labels = labels.to(self.device, non_blocking=True)
@@ -709,7 +717,7 @@ class TrainingManager:
                 LOGGER.warning("Treinamento cancelado na época %d.", epoch)
                 break
 
-            train_loss, train_acc = self.train_epoch()
+            train_loss, train_acc = self.train_epoch(epoch, self.config.epochs)
             val_loss, val_acc = self.validate()
 
             self.history["train_loss"].append(train_loss)
@@ -823,6 +831,272 @@ class GradCAMProcessor:
         return visualization
 
 # =============================================================
+# SERVICE CENTRALIZADO
+# =============================================================
+
+@dataclass
+class ClassificationResult:
+    prediction: int
+    probabilities: torch.Tensor
+    class_labels: list[str]
+    is_binary: bool
+
+@dataclass
+class SegmentationResult:
+    mask: np.ndarray
+    segmented_image: np.ndarray
+
+@dataclass
+class GradCAMResult:
+    visualization: np.ndarray | None
+    error: str | None = None
+
+class ApplicationService:
+    def __init__(self):
+        self.dataset_manager = DatasetManager()
+        self.training_manager: TrainingManager | None = None
+        self.gradcam_processor: GradCAMProcessor | None = None
+        self.current_image: np.ndarray | None = None
+        self.current_sample: Sample | None = None
+
+    def load_dataset(self, dataset_path: str | Path) -> dict[str, int]:
+        dataset_path = Path(dataset_path) if isinstance(dataset_path, str) else dataset_path
+        self.dataset_manager.load_dataset(dataset_path)
+        
+        return {
+            "total_samples": len(self.dataset_manager.samples),
+            "train_samples": len(self.dataset_manager.train_samples),
+            "test_samples": len(self.dataset_manager.test_samples),
+        }
+
+    def has_dataset(self) -> bool:
+        return len(self.dataset_manager.samples) > 0
+
+    def start_training(
+        self,
+        model_type: str,
+        task_type: str,
+        epochs: int,
+        batch_size: int,
+        learning_rate: float,
+        dropout_rate: float,
+        use_segmentation: bool,
+        segmentation_config: SegmentationConfig | None = None,
+        progress_callback: Callable[[int, int, float, float, float, float], None] | None = None,
+        batch_progress_callback: Callable[[int, int, int, int], None] | None = None,
+    ) -> bool:
+        if not self.has_dataset():
+            LOGGER.error("Nenhum dataset carregado")
+            return False
+
+        dataset_config = DatasetConfig(
+            segmented=use_segmentation,
+            augmentation=True,
+            binary_classification=task_type == "binary",
+            image_size=224,
+            segmentation_config=segmentation_config or SegmentationConfig()
+        )
+
+        test_config = DatasetConfig(
+            segmented=use_segmentation,
+            augmentation=False,
+            binary_classification=task_type == "binary",
+            image_size=224,
+            segmentation_config=segmentation_config or SegmentationConfig()
+        )
+
+        train_dataset = MammographyDataset(self.dataset_manager.train_samples, dataset_config)
+        test_dataset = MammographyDataset(self.dataset_manager.test_samples, test_config)
+
+        if len(train_dataset) == 0 or len(test_dataset) == 0:
+            LOGGER.error("Dataset de treino ou teste vazio")
+            return False
+
+        model_folder = Path("models")
+        model_folder.mkdir(parents=True, exist_ok=True)
+        model_path = model_folder / f"{model_type}_{task_type}.pth"
+
+        training_config = TrainingConfig(
+            model_type=ModelType(model_type),
+            epochs=epochs,
+            batch_size=batch_size,
+            learning_rate=learning_rate,
+            dropout_rate=dropout_rate,
+            binary_classification=task_type == "binary",
+            model_path=model_path
+        )
+
+        self.training_manager = TrainingManager(
+            train_dataset,
+            test_dataset,
+            training_config,
+            progress_callback=progress_callback,
+            batch_progress_callback=batch_progress_callback,
+        )
+
+        return True
+
+    def run_training(self) -> tuple[dict[str, list[float]], float, dict[str, Any] | None]:
+        if not self.training_manager:
+            raise RuntimeError("TrainingManager não foi inicializado. Chame start_training primeiro.")
+
+        history, total_time = self.training_manager.train()
+        metrics = None
+
+        if not self.training_manager.cancel_requested:
+            try:
+                metrics = self.training_manager.evaluate()
+            except Exception as e:
+                LOGGER.error("Erro ao calcular métricas finais: %s", e)
+
+        return history, total_time, metrics
+
+    def cancel_training(self) -> None:
+        if self.training_manager:
+            self.training_manager.cancel_requested = True
+
+    def save_model(self, path: Path | None = None) -> bool:
+        if not self.training_manager:
+            LOGGER.error("Nenhum modelo para salvar")
+            return False
+
+        try:
+            self.training_manager.save_model(path)
+            return True
+        except Exception as e:
+            LOGGER.error("Erro ao salvar modelo: %s", e)
+            return False
+
+    def load_model(self, path: Path) -> bool:
+        if not self.has_dataset():
+            LOGGER.error("Nenhum dataset carregado para usar com o modelo")
+            return False
+
+        dataset_config = DatasetConfig(
+            segmented=True,
+            augmentation=False,
+            binary_classification=True,
+            image_size=224,
+            segmentation_config=SegmentationConfig()
+        )
+
+        train_dataset = MammographyDataset(self.dataset_manager.train_samples, dataset_config)
+        test_dataset = MammographyDataset(self.dataset_manager.test_samples, dataset_config)
+
+        training_config = TrainingConfig(
+            model_type=ModelType.RESNET18,
+            epochs=1,
+            batch_size=16,
+            learning_rate=0.001,
+            binary_classification=True,
+            model_path=path
+        )
+
+        self.training_manager = TrainingManager(train_dataset, test_dataset, training_config)
+
+        try:
+            self.training_manager.load_model(path)
+            self.gradcam_processor = GradCAMProcessor(self.training_manager.model)
+            return True
+        except Exception as e:
+            LOGGER.error("Erro ao carregar modelo: %s", e)
+            return False
+
+    def load_image(self, image_path: str | Path) -> bool:
+        try:
+            path = Path(image_path)
+            sample = Sample(
+                path=path,
+                filename=path.name,
+                birads_class=SampleBiradsClass.D,
+                number=1,
+                set_type=SetType.TEST,
+                side=SampleSide.RIGHT,
+                view=SampleView.CC
+            )
+            self.current_sample = sample
+            self.current_image = ImageManager.load(sample)
+            return True
+        except Exception as e:
+            LOGGER.error("Erro ao carregar imagem: %s", e)
+            return False
+
+    def get_current_image(self) -> np.ndarray | None:
+        return self.current_image
+
+    def segment_image(self, image: np.ndarray | None = None, config: SegmentationConfig | None = None) -> SegmentationResult:
+        if image is None:
+            image = self.current_image
+
+        if image is None:
+            raise ValueError("Nenhuma imagem carregada")
+
+        config = config or SegmentationConfig()
+        mask, segmented = SegmentationProcessor.segment(image, config)
+        
+        return SegmentationResult(mask=mask, segmented_image=segmented)
+
+    def _prepare_image_tensor(self, image: np.ndarray, use_segmentation: bool, segmentation_config: SegmentationConfig | None = None) -> tuple[torch.Tensor, np.ndarray]:
+        config = segmentation_config or SegmentationConfig()
+        
+        processed = image.copy()
+        if use_segmentation:
+            _, processed = SegmentationProcessor.segment(processed, config)
+        
+        processed = ImageManager.resize(processed, 224, 224)
+        
+        processed = ImageManager.normalize(processed)
+        
+        processed_rgb = np.stack([processed] * 3, axis=-1)
+        
+        tensor = torch.from_numpy(processed_rgb.transpose((2, 0, 1))).unsqueeze(0).float()
+        
+        return tensor, processed_rgb
+
+    def classify_image(self, image: np.ndarray, task_type: str, use_segmentation: bool, segmentation_config: SegmentationConfig | None = None) -> ClassificationResult:
+        if not self.training_manager:
+            raise RuntimeError("Nenhum modelo carregado para classificação")
+
+        image_tensor, _ = self._prepare_image_tensor(image, use_segmentation, segmentation_config)
+
+        prediction, probabilities = self.training_manager.predict(image_tensor)
+
+        class_labels = list(DEFAULT_BIRADS_LABELS)
+
+        return ClassificationResult(
+            prediction=prediction,
+            probabilities=probabilities,
+            class_labels=class_labels,
+            is_binary=task_type == "binary"
+        )
+
+    def generate_gradcam(
+        self,
+        image: np.ndarray,
+        processed_image: np.ndarray,
+        task_type: str,
+        use_segmentation: bool,
+        segmentation_config: SegmentationConfig | None = None
+    ) -> GradCAMResult:
+        if not self.training_manager:
+            return GradCAMResult(visualization=None, error="Nenhum modelo carregado")
+
+        try:
+            image_tensor, processed_rgb = self._prepare_image_tensor(image, use_segmentation, segmentation_config)
+
+            if self.gradcam_processor is None:
+                self.gradcam_processor = GradCAMProcessor(self.training_manager.model)
+
+            gradcam_tensor = image_tensor.to(self.training_manager.device).requires_grad_(True)
+            heatmap = self.gradcam_processor.generate(gradcam_tensor)
+            overlay = self.gradcam_processor.overlay(processed_image, heatmap)
+
+            return GradCAMResult(visualization=overlay)
+        except Exception as e:
+            LOGGER.error("Erro ao gerar Grad-CAM: %s", e)
+            return GradCAMResult(visualization=None, error=str(e))
+
+# =============================================================
 # INTERFACE GRÁFICA
 # =============================================================
 
@@ -836,16 +1110,29 @@ class TkinterLogHandler(logging.Handler):
         self.callback(msg)
 
 class GUI(tk.Tk):
+    BIRADS_LABELS = DEFAULT_BIRADS_LABELS
+    BINARY_RESULT_LABELS = ("BIRADS I/II", "BIRADS III/IV")
+    BINARY_BAR_CLASS_INDEX = (0, 0, 1, 1)
+    CLASSIFICATION_TASK_OPTIONS = ("Binária", "4 classes")
+    CLASSIFICATION_TASK_VALUE_MAP = {
+        "Binária": "binary",
+        "4 classes": "four",
+    }
+    LEARNING_RATE_OPTIONS = ("0.0001", "0.0003", "0.001", "0.003", "0.01", "0.03", "0.1", "0.3", "1", "3", "10")
+    CLASSIFICATION_PANELS = ("original", "mask", "segmented", "gradcam")
+    PANEL_TITLES = {
+        "original": "Imagem original",
+        "mask": "Mascara",
+        "segmented": "Imagem segmentada",
+        "gradcam": "Grad-CAM",
+    }
+    
     def __init__(self) -> None:
         super().__init__()
         self.title("PAI - Segmentação e Classificação Mamográfica")
+        self.app_service = ApplicationService()
         self.dataset_dir: Path | None = None
-        self.dataset_manager: DatasetManager = DatasetManager()
-        self.training_manager: TrainingManager | None = None
         self.training_thread: threading.Thread | None = None
-        self.current_sample: Sample | None = None
-        self.current_image: np.ndarray | None = None
-        self.current_display: Image.Image | None = None
         self.classification_images: dict[str, Image.Image] = {}
         self.classification_tk_images: dict[str, ImageTk.PhotoImage] = {}
         self.image_canvases: dict[str, tk.Canvas] = {}
@@ -859,26 +1146,37 @@ class GUI(tk.Tk):
         self.confusion_canvas: FigureCanvasTkAgg | None = None
         self.training_metric_labels: dict[str, ttk.Label] = {}
         self.training_metrics_status_label: ttk.Label | None = None
+        self.dataset_status_label: ttk.Label | None = None
+        self.classification_model_status_label: ttk.Label | None = None
         self.message_queue: queue.Queue[str] = queue.Queue()
         self.training_cancel_requested = False
+        self.training_dataset_loaded = False
+        self.training_is_running = False
+        self.training_config_widgets: list[tk.Widget] = []
+        self.training_segmentation_widgets: list[tk.Widget] = []
 
-        self.threshold_offset_var = tk.IntVar(value=0)
-        self.closing_iterations_var = tk.IntVar(value=3)
-        self.kernel_size_var = tk.IntVar(value=3)
-        self.crop_var = tk.BooleanVar(value=False)
+        self.threshold_offset_var = tk.IntVar(value=_DEFAULT_SEGMENTATION_CONFIG.threshold_offset)
+        self.closing_iterations_var = tk.IntVar(value=_DEFAULT_SEGMENTATION_CONFIG.closing_iterations)
+        self.kernel_size_var = tk.IntVar(value=_DEFAULT_SEGMENTATION_CONFIG.kernel_size)
+        self.crop_var = tk.BooleanVar(value=_DEFAULT_SEGMENTATION_CONFIG.crop)
 
-        self.model_var = tk.StringVar(value="resnet18")
+        self.model_var = tk.StringVar(value=str(_DEFAULT_TRAINING_CONFIG.model_type))
         self.task_var = tk.StringVar(value="binary")
+        self.classification_task_var = tk.StringVar(value="Binária")
+        self.binary_classification_var = tk.BooleanVar(value=_DEFAULT_TRAINING_CONFIG.binary_classification)
         self.segmented_var = tk.BooleanVar(value=True)
+        self.classification_show_segmented_var = tk.BooleanVar(value=True)
         self.zoom_var = tk.DoubleVar(value=1.0)
-        self.epochs_var = tk.IntVar(value=10)
-        self.batch_var = tk.IntVar(value=32)
-        self.lr_var = tk.DoubleVar(value=0.001)
+        self.epochs_var = tk.IntVar(value=_DEFAULT_TRAINING_CONFIG.epochs)
+        self.batch_var = tk.IntVar(value=_DEFAULT_TRAINING_CONFIG.batch_size)
+        self.dropout_var = tk.DoubleVar(value=_DEFAULT_TRAINING_CONFIG.dropout_rate)
+        self.lr_var = tk.StringVar(value=str(_DEFAULT_TRAINING_CONFIG.learning_rate))
 
         self.build_layout()
         self.set_training_buttons_state(True)
         self._setup_logging_handler()
         self.after(200, self.flush_messages)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def build_layout(self) -> None:
         self.minsize(1180, 700)
@@ -914,22 +1212,12 @@ class GUI(tk.Tk):
         graph_area.columnconfigure(1, weight=1)
         graph_area.rowconfigure(0, weight=1)
 
-        for column, (chart_key, title, ylabel) in enumerate((
+        chart_specs = (
             ("loss", "Loss", "Loss"),
             ("accuracy", "Acurácia", "Acurácia"),
-        )):
-            frame = ttk.LabelFrame(graph_area, text=title, padding=8)
-            frame.grid(row=0, column=column, sticky="nsew", padx=(0, 6) if column == 0 else (6, 0))
-            frame.rowconfigure(0, weight=1)
-            frame.columnconfigure(0, weight=1)
-            figure = Figure(figsize=(4.2, 2.6), dpi=100)
-            axis = figure.add_subplot(111)
-            canvas = FigureCanvasTkAgg(figure, master=frame)
-            canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
-            self.training_figures[chart_key] = figure
-            self.training_axes[chart_key] = axis
-            self.training_plot_canvases[chart_key] = canvas
-            self._draw_training_history_chart(chart_key, [], [], title, ylabel)
+        )
+        for column, (chart_key, title, ylabel) in enumerate(chart_specs):
+            self.create_chart_panel(graph_area, chart_key, column, title, ylabel)
 
         analytics_area = ttk.Frame(self.training_page)
         analytics_area.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
@@ -985,24 +1273,12 @@ class GUI(tk.Tk):
         image_area = ttk.Frame(self.classification_page)
         image_area.grid(row=0, column=0, sticky="nsew")
         image_area.rowconfigure(0, weight=1)
-        panel_specs = (
-            ("original", "Imagem original"),
-            ("mask", "Mascara"),
-            ("segmented", "Imagem segmentada"),
-            ("gradcam", "Grad-CAM"),
-        )
-        for column in range(len(panel_specs)):
+        
+        for column in range(len(self.CLASSIFICATION_PANELS)):
             image_area.columnconfigure(column, weight=1, uniform="classification_images")
-
-        for column, (key, title) in enumerate(panel_specs):
-            frame = ttk.LabelFrame(image_area, text=title, padding=8)
-            frame.grid(row=0, column=column, sticky="nsew", padx=self.panel_padding(column, len(panel_specs)))
-            frame.rowconfigure(0, weight=1)
-            frame.columnconfigure(0, weight=1)
-            canvas = tk.Canvas(frame, background="#111111", highlightthickness=0)
-            canvas.grid(row=0, column=0, sticky="nsew")
-            canvas.bind("<Configure>", lambda _event, name=key: self.render_classification_panel(name))
-            self.image_canvases[key] = canvas
+        
+        for column, key in enumerate(self.CLASSIFICATION_PANELS):
+            self.create_image_panel_with_canvas(image_area, key, column, len(self.CLASSIFICATION_PANELS))
 
         result_frame = ttk.LabelFrame(self.classification_page, text="Resultado final da classificação", padding=10)
         result_frame.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
@@ -1016,7 +1292,7 @@ class GUI(tk.Tk):
         metrics_frame = ttk.Frame(result_frame)
         metrics_frame.grid(row=1, column=0, sticky="ew", pady=(10, 0))
         metrics_frame.columnconfigure(1, weight=1)
-        for row, label in enumerate(("BIRADS I", "BIRADS II", "BIRADS III", "BIRADS IV")):
+        for row, label in enumerate(self.BIRADS_LABELS):
             ttk.Label(metrics_frame, text=label, width=12).grid(row=row, column=0, sticky="w", pady=2)
             bar = ttk.Progressbar(metrics_frame, maximum=100, value=0)
             bar.grid(row=row, column=1, sticky="ew", padx=8, pady=2)
@@ -1033,6 +1309,52 @@ class GUI(tk.Tk):
             return (6, 0)
         return (6, 6)
 
+    def create_image_panel_with_canvas(self, parent: ttk.Frame, key: str, column: int, total_columns: int) -> tk.Canvas:
+        frame = ttk.LabelFrame(parent, text=self.PANEL_TITLES[key], padding=8)
+        frame.grid(row=0, column=column, sticky="nsew", padx=self.panel_padding(column, total_columns))
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+        canvas = tk.Canvas(frame, background="#111111", highlightthickness=0)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        canvas.bind("<Configure>", lambda _: self.render_classification_panel(key))
+        self.image_canvases[key] = canvas
+        return canvas
+
+    def create_chart_panel(self, parent: ttk.Frame, key: str, column: int, title: str, ylabel: str) -> Figure:
+        frame = ttk.LabelFrame(parent, text=title, padding=8)
+        frame.grid(row=0, column=column, sticky="nsew", padx=(0, 6) if column == 0 else (6, 0))
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+        figure = Figure(figsize=(4.2, 2.6), dpi=100)
+        axis = figure.add_subplot(111)
+        canvas = FigureCanvasTkAgg(figure, master=frame)
+        canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+        self.training_figures[key] = figure
+        self.training_axes[key] = axis
+        self.training_plot_canvases[key] = canvas
+        self._draw_training_history_chart(key, [], [], title, ylabel)
+        return figure
+
+    def add_control_section(self, parent: ttk.Frame, row: int, title: str | None = None) -> int:
+        if title is not None:
+            ttk.Label(parent, text=title).grid(row=row, column=0, sticky="w", pady=(10, 0) if row > 0 else 0)
+            return row + 1
+        ttk.Separator(parent).grid(row=row, column=0, sticky="ew", pady=8)
+        return row + 1
+
+    def add_control(
+        self,
+        parent: ttk.Frame,
+        row: int,
+        label_text: str,
+        control_widget: tk.Widget,
+        pady_label: tuple[int, int] = (0, 0),
+        pady_control: tuple[int, int] = (0, 0),
+    ) -> int:
+        ttk.Label(parent, text=label_text).grid(row=row, column=0, sticky="w", pady=pady_label)
+        control_widget.grid(row=row + 1, column=0, sticky="ew", pady=pady_control)
+        return row + 2
+
     def on_tab_changed(self, _event: tk.Event | None = None) -> None:
         tab_text = self.notebook.tab(self.notebook.select(), "text")
         if tab_text == "Classificação":
@@ -1048,98 +1370,249 @@ class GUI(tk.Tk):
 
     def build_sidebar_for_training(self) -> None:
         panel = self.clear_sidebar()
-        ttk.Label(panel, text="Treinamento", font=("TkDefaultFont", 11, "bold")).grid(row=0, column=0, sticky="w")
+        self.training_config_widgets = []
+        self.training_segmentation_widgets = []
 
-        ttk.Button(panel, text="Selecionar dataset", command=self.choose_dataset).grid(row=1, column=0, sticky="ew", pady=(12, 3))
+        row = 0
+        ttk.Label(panel, text="Treinamento", font=("TkDefaultFont", 11, "bold")).grid(row=row, column=0, sticky="w")
+        row += 1
 
-        ttk.Separator(panel).grid(row=2, column=0, sticky="ew", pady=8)
-        ttk.Label(panel, text="Selecionar modelo").grid(row=3, column=0, sticky="w")
-        ttk.Combobox(panel, textvariable=self.model_var, values=["resnet18", "efficientnet_b0"], state="readonly").grid(
-            row=4, column=0, sticky="ew"
+        ttk.Button(panel, text="Selecionar dataset", command=self.choose_dataset).grid(
+            row=row,
+            column=0,
+            sticky="ew",
+            pady=(12, 3)
         )
+        row += 1
 
-        ttk.Label(panel, text="Parametros gerais").grid(row=5, column=0, sticky="w", pady=(10, 0))
-        ttk.Label(panel, text="Tarefa").grid(row=6, column=0, sticky="w")
-        ttk.Combobox(panel, textvariable=self.task_var, values=["binary", "four"], state="readonly").grid(
-            row=7, column=0, sticky="ew"
-        )
-        ttk.Checkbutton(panel, text="Usar imagens segmentadas", variable=self.segmented_var).grid(
-            row=8, column=0, sticky="w", pady=5
-        )
-        ttk.Label(panel, text="Epocas").grid(row=9, column=0, sticky="w")
-        ttk.Spinbox(panel, from_=1, to=50, textvariable=self.epochs_var, width=8).grid(row=10, column=0, sticky="ew")
-        ttk.Label(panel, text="Batch").grid(row=11, column=0, sticky="w", pady=(8, 0))
-        ttk.Spinbox(panel, from_=1, to=64, textvariable=self.batch_var, width=8).grid(row=12, column=0, sticky="ew")
-        ttk.Label(panel, text="Learning rate").grid(row=13, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(panel, textvariable=self.lr_var).grid(row=14, column=0, sticky="ew")
+        dataset_text = "Conjunto de dados não selecionado"
+        if self.dataset_dir is not None:
+            dataset_text = f"Conjunto de dados: {self.dataset_dir.name}"
+        self.dataset_status_label = ttk.Label(panel, text=dataset_text, wraplength=220, justify="left")
+        self.dataset_status_label.grid(row=row, column=0, sticky="w")
+        row += 1
 
-        ttk.Separator(panel).grid(row=15, column=0, sticky="ew", pady=10)
+        row = self.add_control_section(panel, row)
+        ttk.Label(panel, text="Configurações de treino").grid(row=row, column=0, sticky="w")
+        row += 1
+
+        model_combo = ttk.Combobox(
+            panel,
+            textvariable=self.model_var,
+            values=["resnet18", "efficientnet_b0", "efficientnet_b1", "efficientnet_b2", "efficientnet_b3"],
+            state="readonly"
+        )
+        row = self.add_control(panel, row, "Modelo", model_combo, pady_label=(8, 0))
+        self.training_config_widgets.append(model_combo)
+
+        batch_spin = ttk.Spinbox(panel, from_=1, to=256, textvariable=self.batch_var, width=8)
+        row = self.add_control(panel, row, "Tamanho do batch", batch_spin, pady_label=(8, 0))
+        self.training_config_widgets.append(batch_spin)
+
+        lr_combo = ttk.Combobox(
+            panel,
+            textvariable=self.lr_var,
+            values=list(self.LEARNING_RATE_OPTIONS),
+            state="readonly"
+        )
+        row = self.add_control(panel, row, "Taxa de aprendizado", lr_combo, pady_label=(8, 0))
+        self.training_config_widgets.append(lr_combo)
+
+        binary_check = ttk.Checkbutton(panel, text="Classificação binária", variable=self.binary_classification_var)
+        binary_check.grid(row=row, column=0, sticky="w", pady=(8, 2))
+        self.training_config_widgets.append(binary_check)
+        row += 1
+
+        epochs_spin = ttk.Spinbox(panel, from_=1, to=200, textvariable=self.epochs_var, width=8)
+        row = self.add_control(panel, row, "Número de épocas", epochs_spin, pady_label=(8, 0))
+        self.training_config_widgets.append(epochs_spin)
+
+        dropout_spin = ttk.Spinbox(panel, from_=0.0, to=0.9, increment=0.05, textvariable=self.dropout_var, width=8)
+        row = self.add_control(panel, row, "Taxa de dropout", dropout_spin, pady_label=(8, 0))
+        self.training_config_widgets.append(dropout_spin)
+
+        segmented_check = ttk.Checkbutton(
+            panel,
+            text="Usar imagens segmentadas",
+            variable=self.segmented_var,
+            command=self.update_training_segmentation_controls_state,
+        )
+        segmented_check.grid(row=row, column=0, sticky="w", pady=(8, 2))
+        self.training_config_widgets.append(segmented_check)
+        row += 1
+
+        ttk.Label(panel, text="Configuração de segmentação").grid(row=row, column=0, sticky="w", pady=(8, 0))
+        row += 1
+
+        threshold_spin = ttk.Spinbox(panel, from_=-50, to=50, textvariable=self.threshold_offset_var)
+        row = self.add_control(panel, row, "Ajuste do limiar", threshold_spin)
+        self.training_segmentation_widgets.append(threshold_spin)
+
+        closing_spin = ttk.Spinbox(panel, from_=1, to=10, textvariable=self.closing_iterations_var)
+        row = self.add_control(panel, row, "Iterações de fechamento", closing_spin)
+        self.training_segmentation_widgets.append(closing_spin)
+
+        kernel_spin = ttk.Spinbox(panel, from_=3, to=15, increment=2, textvariable=self.kernel_size_var)
+        row = self.add_control(panel, row, "Tamanho do kernel", kernel_spin)
+        self.training_segmentation_widgets.append(kernel_spin)
+
+        crop_check = ttk.Checkbutton(panel, text="Recortar região de interesse (ROI)", variable=self.crop_var)
+        crop_check.grid(row=row, column=0, sticky="w", pady=(2, 6))
+        self.training_segmentation_widgets.append(crop_check)
+        row += 1
+
+        row = self.add_control_section(panel, row)
+        
         self.start_training_button = ttk.Button(panel, text="Treinar dataset/modelo", command=self.start_training)
-        self.start_training_button.grid(row=16, column=0, sticky="ew", pady=3)
+        self.start_training_button.grid(row=row, column=0, sticky="ew", pady=3)
+        row += 1
+        
         self.cancel_training_button = ttk.Button(panel, text="Cancelar treinamento", command=self.cancel_training)
-        self.cancel_training_button.grid(row=17, column=0, sticky="ew", pady=3)
+        self.cancel_training_button.grid(row=row, column=0, sticky="ew", pady=3)
+        row += 1
+        
         self.export_model_button = ttk.Button(panel, text="Exportar modelo treinado", command=self.export_trained_model)
-        self.export_model_button.grid(row=18, column=0, sticky="ew", pady=3)
+        self.export_model_button.grid(row=row, column=0, sticky="ew", pady=3)
+        row += 1
 
-        ttk.Label(panel, text="Progresso de treino").grid(row=19, column=0, sticky="w", pady=(10, 0))
+        ttk.Label(panel, text="Progresso de treino").grid(row=row, column=0, sticky="w", pady=(10, 0))
+        row += 1
+        
         self.training_progress_bar = ttk.Progressbar(panel, maximum=100)
-        self.training_progress_bar.grid(row=20, column=0, sticky="ew", pady=4)
+        self.training_progress_bar.grid(row=row, column=0, sticky="ew", pady=4)
+        row += 1
+        
         self.training_status_label = ttk.Label(panel, text="Aguardando treino...")
-        self.training_status_label.grid(row=21, column=0, sticky="w")
+        self.training_status_label.grid(row=row, column=0, sticky="w")
+        row += 1
 
-        ttk.Separator(panel).grid(row=22, column=0, sticky="ew", pady=10)
+        ttk.Separator(panel).grid(row=row, column=0, sticky="ew", pady=(10, 4))
+        row += 1
+        ttk.Button(panel, text="Limpar logs", command=self._clear_logs).grid(row=row, column=0, sticky="ew", pady=3)
+
+        self.update_training_controls_state()
 
     def build_sidebar_for_classification(self) -> None:
         panel = self.clear_sidebar()
-        ttk.Label(panel, text="Classificação", font=("TkDefaultFont", 11, "bold")).grid(row=0, column=0, sticky="w")
-        ttk.Button(panel, text="Selecionar imagem", command=self.open_classification_image).grid(
-            row=1, column=0, sticky="ew", pady=(12, 3)
+        row = 0
+        ttk.Label(panel, text="Classificação", font=("TkDefaultFont", 11, "bold")).grid(row=row, column=0, sticky="w")
+        row += 1
+
+        self.classification_model_status_label = ttk.Label(panel, text="Modelo: não carregado", wraplength=220, justify="left")
+        self.classification_model_status_label.grid(row=row, column=0, sticky="w", pady=(8, 4))
+        row += 1
+
+        self.classification_import_button = ttk.Button(panel, text="Importar modelo", command=self.load_existing_model)
+        self.classification_import_button.grid(row=row, column=0, sticky="ew", pady=3)
+        row += 1
+
+        self.classification_open_image_button = ttk.Button(panel, text="Selecionar imagem", command=self.open_image)
+        self.classification_open_image_button.grid(row=row, column=0, sticky="ew", pady=3)
+        row += 1
+
+        row = self.add_control_section(panel, row)
+
+        self.classification_task_combo = ttk.Combobox(
+            panel,
+            textvariable=self.classification_task_var,
+            values=list(self.CLASSIFICATION_TASK_OPTIONS),
+            state="readonly"
         )
+        row = self.add_control(panel, row, "Tipo de classificação", self.classification_task_combo)
 
-        ttk.Separator(panel).grid(row=2, column=0, sticky="ew", pady=8)
-        ttk.Label(panel, text="Zoom").grid(row=3, column=0, sticky="w")
-        ttk.Scale(panel, from_=0.2, to=3.0, variable=self.zoom_var, command=lambda _value: self.refresh_image()).grid(
-            row=4, column=0, sticky="ew"
+        self.classification_segmented_check = ttk.Checkbutton(
+            panel,
+            text="Usar imagem segmentada",
+            variable=self.classification_show_segmented_var,
+            command=self._update_classification_preview,
         )
-        ttk.Button(panel, text="Zoom 100%", command=self.reset_zoom).grid(row=5, column=0, sticky="ew", pady=3)
+        self.classification_segmented_check.grid(row=row, column=0, sticky="w", pady=3)
+        row += 1
 
-        ttk.Separator(panel).grid(row=6, column=0, sticky="ew", pady=8)
-        ttk.Button(panel, text="Carregar modelo para classificação", command=self.load_existing_model).grid(row=7, column=0, sticky="ew", pady=3)
-        self.classify_button = ttk.Button(panel, text="Classificar imagem", command=self.classify_current_image, state="disabled")
-        self.classify_button.grid(row=8, column=0, sticky="ew", pady=3)
+        self.classify_button = ttk.Button(panel, text="Classificar imagem", command=self.classify_current_image)
+        self.classify_button.grid(row=row, column=0, sticky="ew", pady=3)
+        row += 1
 
-        ttk.Separator(panel).grid(row=9, column=0, sticky="ew", pady=8)
+        row = self.add_control_section(panel, row)
+        ttk.Label(panel, text="Zoom").grid(row=row, column=0, sticky="w")
+        row += 1
+        ttk.Scale(panel, from_=0.2, to=3.0, variable=self.zoom_var, command=lambda _value: self.refresh_image()).grid(row=row, column=0, sticky="ew")
+        row += 1
+        ttk.Button(panel, text="Zoom 100%", command=self.reset_zoom).grid(row=row, column=0, sticky="ew", pady=3)
 
-        ttk.Label(panel, text="Threshold Offset").grid(row=10, column=0, sticky="w")
-        ttk.Spinbox(
-            panel,
-            from_=-50,
-            to=50,
-            textvariable=self.threshold_offset_var
-        ).grid(row=11, column=0, sticky="ew")
+        self.update_classification_controls_state()
 
-        ttk.Label(panel, text="Closing Iterations").grid(row=12, column=0, sticky="w")
-        ttk.Spinbox(
-            panel,
-            from_=1,
-            to=10,
-            textvariable=self.closing_iterations_var
-        ).grid(row=13, column=0, sticky="ew")
+    def update_classification_controls_state(self) -> None:
+        has_model = self.app_service.training_manager is not None
+        has_image = self.app_service.get_current_image() is not None
 
-        ttk.Label(panel, text="Kernel Size").grid(row=14, column=0, sticky="w")
-        ttk.Spinbox(
-            panel,
-            from_=3,
-            to=15,
-            increment=2,
-            textvariable=self.kernel_size_var
-        ).grid(row=15, column=0, sticky="ew")
+        if self.classification_model_status_label is not None:
+            self.classification_model_status_label.config(
+                text="Modelo: em memória" if has_model else "Modelo: não carregado (importe para classificar)"
+            )
 
-        ttk.Checkbutton(
-            panel,
-            text="Crop ROI",
-            variable=self.crop_var
-        ).grid(row=16, column=0, sticky="w")
+        if hasattr(self, "classification_import_button"):
+            self.classification_import_button.config(state="normal")
+        if hasattr(self, "classification_open_image_button"):
+            self.classification_open_image_button.config(state="normal" if has_model else "disabled")
+        if hasattr(self, "classification_task_combo"):
+            self.classification_task_combo.config(state="readonly" if has_model else "disabled")
+        if hasattr(self, "classification_segmented_check"):
+            self.classification_segmented_check.config(state="normal" if has_model else "disabled")
+        if hasattr(self, "classify_button"):
+            self.classify_button.config(state="normal" if (has_model and has_image) else "disabled")
+
+    def _update_classification_preview(self) -> None:
+        current_image = self.app_service.get_current_image()
+        if current_image is None:
+            return
+
+        image_pil = ImageManager.to_pil(current_image)
+        self.set_classification_image("original", image_pil)
+
+        if self.classification_show_segmented_var.get():
+            seg_result = self.app_service.segment_image(config=self.get_segmentation_config())
+            self.set_classification_image("mask", ImageManager.to_pil(seg_result.mask * 255))
+            self.set_classification_image("segmented", ImageManager.to_pil(seg_result.segmented_image * 255))
+        else:
+            self.set_classification_image("mask", None)
+            self.set_classification_image("segmented", None)
+
+        self.set_classification_image("gradcam", None)
+
+    def _get_classification_task_type(self) -> str:
+        return self.CLASSIFICATION_TASK_VALUE_MAP.get(self.classification_task_var.get(), "binary")
+
+    def set_classification_image(self, key: str, image: Image.Image | None) -> None:
+        self.classification_images[key] = image
+        self.render_classification_panel(key)
+
+    def render_classification_panel(self, key: str) -> None:
+        canvas = self.image_canvases.get(key)
+        if canvas is None:
+            return
+
+        image = self.classification_images.get(key)
+        if image is None:
+            self.draw_placeholder(canvas, self.PANEL_TITLES.get(key, key))
+            return
+
+        canvas_w = max(canvas.winfo_width(), 1)
+        canvas_h = max(canvas.winfo_height(), 1)
+        zoom = self.zoom_var.get()
+        target_w = max(1, int(canvas_w * zoom))
+        target_h = max(1, int(canvas_h * zoom))
+
+        resized = image.resize((target_w, target_h), Image.Resampling.LANCZOS)
+        tk_image = ImageTk.PhotoImage(resized)
+        self.classification_tk_images[key] = tk_image
+
+        canvas.delete("all")
+        canvas.create_image(canvas_w // 2, canvas_h // 2, anchor="center", image=tk_image)
+
+    def reset_zoom(self) -> None:
+        self.zoom_var.set(1.0)
+        self.refresh_image()
 
     @staticmethod
     def draw_placeholder(canvas: tk.Canvas, text: str) -> None:
@@ -1159,50 +1632,39 @@ class GUI(tk.Tk):
         self.after(200, self.flush_messages)
 
     def load_dataset(self, dataset_dir: Path) -> None:
-        self.dataset_dir = dataset_dir
-        self.dataset_manager.load_dataset(dataset_dir)
+        try:
+            self.dataset_dir = dataset_dir
+            stats = self.app_service.load_dataset(dataset_dir)
+            self.training_dataset_loaded = stats["total_samples"] > 0
+            LOGGER.info(
+                "Dataset carregado: %d amostras (%d treino, %d teste)",
+                stats["total_samples"],
+                stats["train_samples"],
+                stats["test_samples"],
+            )
+            if self.dataset_status_label is not None:
+                self.dataset_status_label.config(
+                    text=f"Conjunto de dados: {dataset_dir.name} ({stats['train_samples']} treino / {stats['test_samples']} teste)"
+                )
+        finally:
+            self.update_training_controls_state()
 
     def choose_dataset(self) -> None:
         directory = filedialog.askdirectory(initialdir=str(self.dataset_dir if self.dataset_dir and self.dataset_dir.exists() else Path.cwd()))
         if directory:
             self.load_dataset(Path(directory))
 
-    def create_training_config(self) -> TrainingConfig:
-        """Gera a configuração de treino a partir dos controles da interface."""
-        model_type = ModelType(self.model_var.get())
-        binary = self.task_var.get() == "binary"
-        model_folder = Path("models")
-        model_folder.mkdir(parents=True, exist_ok=True)
-
-        model_path = model_folder / f"{model_type.value}_{self.task_var.get()}.pth"
-
-        return TrainingConfig(
-            model_type=model_type,
-            epochs=self.epochs_var.get(),
-            batch_size=self.batch_var.get(),
-            learning_rate=self.lr_var.get(),
-            binary_classification=binary,
-            model_path=model_path
-        )
-
-    def create_dataset_config(self) -> DatasetConfig:
-        """Gera a configuração de dataset a partir da interface."""
-        return DatasetConfig(
-            segmented=self.segmented_var.get(),
-            augmentation=True,
-            binary_classification=self.task_var.get() == "binary",
-            image_size=224,
-            segmentation_config=SegmentationConfig(
-                threshold_offset=self.threshold_offset_var.get(),
-                closing_iterations=self.closing_iterations_var.get(),
-                kernel_size=self.kernel_size_var.get(),
-                crop=self.crop_var.get()
-            )
+    def get_segmentation_config(self) -> SegmentationConfig:
+        return SegmentationConfig(
+            threshold_offset=self.threshold_offset_var.get(),
+            closing_iterations=self.closing_iterations_var.get(),
+            kernel_size=self.kernel_size_var.get(),
+            crop=self.crop_var.get()
         )
 
     def start_training(self) -> None:
-        """Inicia o treinamento em segundo plano para não travar o GUI."""
-        if not self.ensure_records():
+        if not self.app_service.has_dataset():
+            messagebox.showinfo("Dataset", "Selecione um dataset primeiro.")
             return
 
         if self.training_thread and self.training_thread.is_alive():
@@ -1210,131 +1672,146 @@ class GUI(tk.Tk):
             return
 
         try:
-            dataset_config = self.create_dataset_config()
-            test_config = DatasetConfig(
-                segmented=dataset_config.segmented,
-                augmentation=False,
-                binary_classification=dataset_config.binary_classification,
-                image_size=dataset_config.image_size,
-                segmentation_config=dataset_config.segmentation_config
+            task_type = "binary" if self.binary_classification_var.get() else "four"
+            self.task_var.set(task_type)
+
+            success = self.app_service.start_training(
+                model_type=self.model_var.get(),
+                task_type=task_type,
+                epochs=self.epochs_var.get(),
+                batch_size=self.batch_var.get(),
+                learning_rate=float(self.lr_var.get()),
+                dropout_rate=float(self.dropout_var.get()),
+                use_segmentation=self.segmented_var.get(),
+                segmentation_config=self.get_segmentation_config(),
+                progress_callback=self.update_training_progress,
+                batch_progress_callback=self.update_training_batch_progress,
             )
 
-            train_dataset = MammographyDataset(self.dataset_manager.train_samples, dataset_config)
-            test_dataset = MammographyDataset(self.dataset_manager.test_samples, test_config)
-
-            if len(train_dataset) == 0 or len(test_dataset) == 0:
-                messagebox.showinfo(
-                    "Treinamento",
-                    "O dataset precisa conter amostras de treino e teste. Verifique o conjunto carregado."
-                )
+            if not success:
+                messagebox.showinfo("Treinamento", "O dataset precisa conter amostras de treino e teste. Verifique o conjunto carregado.")
                 return
-
-            config = self.create_training_config()
-            self.training_manager = TrainingManager(
-                train_dataset,
-                test_dataset,
-                config,
-                progress_callback=self.update_training_progress
-            )
-            self.training_manager.cancel_requested = False
 
             self.training_progress_bar["value"] = 0
             self.training_status_label.config(text="Preparando treino...")
             self.clear_training_outputs()
+            self.training_is_running = True
             self.set_training_buttons_state(False)
-            self.log_message("Iniciando treinamento em segundo plano...")
+            LOGGER.info("Iniciando treinamento em segundo plano...")
 
-            self.training_thread = threading.Thread(
-                target=self._run_training,
-                args=(self.training_manager,),
-                daemon=True
-            )
+            self.training_thread = threading.Thread(target=self._run_training, daemon=True)
             self.training_thread.start()
 
         except Exception as exc:
             LOGGER.error("Erro ao iniciar treinamento: %s", exc)
             messagebox.showerror("Erro", str(exc))
+            self.training_is_running = False
             self.set_training_buttons_state(True)
 
-    def _run_training(self, manager: TrainingManager) -> None:
+    def _run_training(self) -> None:
         try:
-            manager.train()
-            manager.save_model()
-            final_metrics = None
-            if not manager.cancel_requested:
-                try:
-                    final_metrics = manager.evaluate()
-                except Exception as exc:
-                    LOGGER.error("Erro ao calcular métricas finais: %s", exc)
-                    self.log_message(f"Erro ao calcular métricas finais: {exc}")
-            self.log_message("Treinamento finalizado e modelo salvo com sucesso.")
+            history, total_time, metrics = self.app_service.run_training()
+            LOGGER.info("Treinamento finalizado em %.2fs. Use 'Exportar modelo' para salvar.", total_time)
             self.after(0, self.render_training_history)
-            self.after(0, lambda metrics=final_metrics: self.render_training_evaluation(metrics))
+            self.after(0, lambda: self.render_training_evaluation(metrics))
         except Exception as exc:
             LOGGER.error("Erro durante treinamento: %s", exc)
             self.after(0, lambda: messagebox.showerror("Erro", str(exc)))
         finally:
+            self.training_is_running = False
             self.after(0, lambda: self.set_training_buttons_state(True))
 
     def cancel_training(self) -> None:
-        if not self.training_manager:
-            return
-
-        self.training_manager.cancel_requested = True
-        self.log_message("Solicitação de cancelamento enviada. O treinamento será interrompido após a etapa atual.")
+        self.app_service.cancel_training()
+        LOGGER.info("Solicitação de cancelamento enviada. O treinamento será interrompido após a etapa atual.")
 
     def export_trained_model(self) -> None:
-        if not self.training_manager:
-            messagebox.showinfo("Exportar modelo", "Nenhum modelo treinado disponível. Treine um modelo primeiro.")
-            return
-
         path = filedialog.asksaveasfilename(
             defaultextension=".pth",
             filetypes=[("PyTorch model", "*.pth")],
-            initialfile=self.training_manager.config.model_path.name,
-            initialdir=str(self.training_manager.config.model_path.parent)
+            initialfile="model.pth",
+            initialdir=str(Path("models").resolve())
         )
 
         if not path:
             return
 
         try:
-            self.training_manager.save_model(Path(path))
+            self.app_service.save_model(Path(path))
             messagebox.showinfo("Exportar modelo", f"Modelo exportado para {path}")
         except Exception as exc:
             LOGGER.error("Erro ao exportar modelo: %s", exc)
             messagebox.showerror("Erro", str(exc))
 
     def set_training_buttons_state(self, enabled: bool) -> None:
-        if hasattr(self, "start_training_button") and hasattr(self, "cancel_training_button") and hasattr(self, "export_model_button"):
-            self.start_training_button.config(state="normal" if enabled else "disabled")
-            self.cancel_training_button.config(state="normal" if not enabled else "disabled")
-            self.export_model_button.config(state="normal" if enabled else "disabled")
+        self.training_is_running = not enabled
+        self.update_training_controls_state()
 
-    def update_training_progress(
-        self,
-        epoch: int,
-        total_epochs: int,
-        train_loss: float,
-        train_acc: float,
-        val_loss: float,
-        val_acc: float,
-    ) -> None:
-        percent = int((epoch / total_epochs) * 100)
+    @staticmethod
+    def _set_widget_enabled(widget: tk.Widget, enabled: bool) -> None:
+        try:
+            if isinstance(widget, ttk.Combobox):
+                widget.config(state="readonly" if enabled else "disabled")
+            else:
+                widget.config(state="normal" if enabled else "disabled")
+        except tk.TclError:
+            pass
+
+    def update_training_controls_state(self) -> None:
+        config_enabled = self.training_dataset_loaded and not self.training_is_running
+
+        for widget in self.training_config_widgets:
+            self._set_widget_enabled(widget, config_enabled)
+
+        self.update_training_segmentation_controls_state()
+
+        has_model = self.app_service.training_manager is not None
+        if hasattr(self, "start_training_button"):
+            self.start_training_button.config(state="normal" if config_enabled else "disabled")
+        if hasattr(self, "export_model_button"):
+            self.export_model_button.config(state="normal" if (has_model and not self.training_is_running) else "disabled")
+        if hasattr(self, "cancel_training_button"):
+            self.cancel_training_button.config(state="normal" if self.training_is_running else "disabled")
+
+    def update_training_segmentation_controls_state(self) -> None:
+        segmentation_enabled = (
+            self.training_dataset_loaded
+            and not self.training_is_running
+            and self.segmented_var.get()
+        )
+        for widget in self.training_segmentation_widgets:
+            self._set_widget_enabled(widget, segmentation_enabled)
+
+    def update_training_batch_progress(self, epoch: int, total_epochs: int, batch_index: int, total_batches: int,) -> None:
+        if total_batches <= 0 or total_epochs <= 0:
+            return
+
+        completed_steps = (epoch - 1) * total_batches + batch_index
+        total_steps = total_epochs * total_batches
+        percent = (completed_steps / total_steps) * 100.0
+
         self.after(0, lambda: self.training_progress_bar.config(value=percent))
+        self.after(0, lambda: self.training_status_label.config(
+                text=f"Época {epoch}/{total_epochs} | Lote {batch_index}/{total_batches} | {percent:.1f}%"))
+
+    def update_training_progress(self, epoch: int, total_epochs: int, train_loss: float, train_acc: float, val_loss: float, val_acc: float) -> None:
         self.after(
             0,
             lambda: self.training_status_label.config(
-                text=f"Época {epoch}/{total_epochs} | loss {train_loss:.4f} | acc {train_acc:.4f} | val {val_acc:.4f}"
+                text=(
+                    f"Época {epoch}/{total_epochs} concluída | perda {train_loss:.4f} | "
+                    f"acurácia {train_acc:.4f} | val {val_acc:.4f}"
+                )
             ),
         )
         self.after(0, self.render_training_history)
 
     def render_training_history(self) -> None:
-        if not self.training_manager:
+        training_manager = self.app_service.training_manager
+        if training_manager is None:
             return
 
-        history = self.training_manager.history
+        history = training_manager.history
         self._draw_training_history_chart(
             "loss",
             history["train_loss"],
@@ -1350,14 +1827,7 @@ class GUI(tk.Tk):
             "Acurácia"
         )
 
-    def _draw_training_history_chart(
-        self,
-        chart_key: str,
-        train_values: list[float],
-        val_values: list[float],
-        title: str,
-        ylabel: str,
-    ) -> None:
+    def _draw_training_history_chart(self, chart_key: str, train_values: list[float], val_values: list[float], title: str, ylabel: str,) -> None:
         axis = self.training_axes.get(chart_key)
         figure = self.training_figures.get(chart_key)
         canvas = self.training_plot_canvases.get(chart_key)
@@ -1468,180 +1938,66 @@ class GUI(tk.Tk):
             return "-"
 
     def load_existing_model(self) -> None:
-        path = filedialog.askopenfilename(
-            filetypes=[("PyTorch model", "*.pth")],
-            initialdir=str(Path("models").resolve())
-        )
+        path = filedialog.askopenfilename(filetypes=[("PyTorch model", "*.pth")], initialdir=str(Path("models").resolve()))
 
         if not path:
             return
 
-        model_config = self.create_training_config()
-        dataset_config = DatasetConfig(
-            segmented=self.segmented_var.get(),
-            augmentation=False,
-            binary_classification=self.task_var.get() == "binary",
-            image_size=224,
-            segmentation_config=SegmentationConfig(
-                threshold_offset=self.threshold_offset_var.get(),
-                closing_iterations=self.closing_iterations_var.get(),
-                kernel_size=self.kernel_size_var.get(),
-                crop=self.crop_var.get()
-            )
-        )
-
-        train_dataset = MammographyDataset(self.dataset_manager.train_samples, dataset_config)
-        test_dataset = MammographyDataset(self.dataset_manager.test_samples, dataset_config)
-
-        self.training_manager = TrainingManager(
-            train_dataset,
-            test_dataset,
-            model_config,
-            progress_callback=self.update_training_progress,
-        )
-
         try:
-            self.training_manager.load_model(Path(path))
-            self.log_message(f"Modelo carregado de {path}")
-            self.classify_button.config(state="normal")
+            if self.app_service.load_model(Path(path)):
+                LOGGER.info("Modelo carregado de %s", path)
+                self.update_classification_controls_state()
+            else:
+                messagebox.showerror("Erro", "Falha ao carregar o modelo. Verifique se o dataset está carregado.")
         except Exception as exc:
             LOGGER.error("Erro ao carregar modelo: %s", exc)
             messagebox.showerror("Erro", str(exc))
 
-    def classify_current_image(self) -> None:
-        if self.current_image is None:
-            messagebox.showinfo("Classificação", "Abra uma imagem para classificar.")
-            return
-
-        if not self.training_manager:
-            messagebox.showinfo("Classificação", "Carregue um modelo ou treine um modelo primeiro.")
-            return
-
-        config = DatasetConfig(
-            segmented=self.segmented_var.get(),
-            augmentation=False,
-            binary_classification=self.task_var.get() == "binary",
-            image_size=224,
-            segmentation_config=SegmentationConfig(
-                threshold_offset=self.threshold_offset_var.get(),
-                closing_iterations=self.closing_iterations_var.get(),
-                kernel_size=self.kernel_size_var.get(),
-                crop=self.crop_var.get()
-            )
-        )
-
-        processed_image = self.current_image.copy()
-        if config.segmented:
-            _, processed_image = SegmentationProcessor.segment(processed_image, config.segmentation_config)
-
-        processed_image = ImageManager.resize(processed_image, config.image_size, config.image_size)
-        processed_image = ImageManager.normalize(processed_image)
-        processed_image = np.stack([processed_image] * 3, axis=-1)
-
-        image_tensor = torch.from_numpy(processed_image.transpose((2, 0, 1))).unsqueeze(0).float()
-
-        prediction, probabilities = self.training_manager.predict(image_tensor)
-
-        class_labels = [
-            "BIRADS I",
-            "BIRADS II",
-            "BIRADS III",
-            "BIRADS IV"
-        ]
-
-        if config.binary_classification:
-            label = "BIRADS I/II" if prediction == 0 else "BIRADS III/IV"
-            self.result_text.configure(state="normal")
-            self.result_text.delete("1.0", "end")
-            self.result_text.insert("end", f"Resultado binário: {label}\n")
-            self.result_text.insert("end", f"Confiança: {probabilities[prediction].item() * 100:.2f}%\n")
-            self.result_text.configure(state="disabled")
-
-            confidence_0 = probabilities[0].item() * 100
-            confidence_1 = probabilities[1].item() * 100
-            for label_name, value in zip(
-                ["BIRADS I", "BIRADS II", "BIRADS III", "BIRADS IV"],
-                [confidence_0, confidence_0, confidence_1, confidence_1]
-            ):
-                self.result_bars[label_name].config(value=value)
-                self.result_percent_labels[label_name].config(text=f"{value:.1f}%")
-        else:
-            label = class_labels[prediction]
-            self.result_text.configure(state="normal")
-            self.result_text.delete("1.0", "end")
-            self.result_text.insert("end", f"Resultado: {label}\n")
-            self.result_text.insert("end", "Probabilidades por classe:\n")
-            for index, class_name in enumerate(class_labels):
-                self.result_text.insert("end", f"  {class_name}: {probabilities[index].item() * 100:.2f}%\n")
-            self.result_text.configure(state="disabled")
-
-            for class_name, prob_value in zip(class_labels, probabilities.tolist()):
-                self.result_bars[class_name].config(value=prob_value * 100)
-                self.result_percent_labels[class_name].config(text=f"{prob_value * 100:.1f}%")
-
-        self.update_gradcam_panel(image_tensor, processed_image)
-        self.log_message(f"Classificação concluída: {label}")
-
-    def update_gradcam_panel(self, image_tensor: torch.Tensor, base_image: np.ndarray) -> None:
-        if not self.training_manager:
+    def update_gradcam_panel(self) -> None:
+        if not self.app_service.training_manager or self.app_service.get_current_image() is None:
             self.set_classification_image("gradcam", None)
             return
 
         try:
-            gradcam_tensor = image_tensor.to(self.training_manager.device).requires_grad_(True)
-            gradcam = GradCAMProcessor(self.training_manager.model)
-            heatmap = gradcam.generate(gradcam_tensor)
-            overlay = gradcam.overlay(base_image, heatmap)
-            self.set_classification_image("gradcam", Image.fromarray(overlay.astype(np.uint8)))
+            gradcam_result = self.app_service.generate_gradcam(
+                self.app_service.get_current_image(),
+                self.app_service.get_current_image(),
+                task_type=self._get_classification_task_type(),
+                use_segmentation=self.classification_show_segmented_var.get(),
+                segmentation_config=self.get_segmentation_config()
+            )
+            
+            if gradcam_result.visualization is not None:
+                self.set_classification_image("gradcam", Image.fromarray(gradcam_result.visualization.astype(np.uint8)))
+            else:
+                self.set_classification_image("gradcam", None)
+                if gradcam_result.error:
+                    LOGGER.warning("Grad-CAM indisponível: %s", gradcam_result.error)
+
         except Exception as exc:
             self.set_classification_image("gradcam", None)
             LOGGER.error("Erro ao gerar Grad-CAM: %s", exc)
-            self.log_message(f"Grad-CAM indisponível: {exc}")
 
     def open_image(self) -> None:
-        filename = filedialog.askopenfilename(
-            filetypes=[("Imagens", "*.png *.tif *.tiff")]
-        )
+        if self.app_service.training_manager is None:
+            messagebox.showinfo("Classificação", "Importe um modelo antes de selecionar a imagem.")
+            return
+
+        filename = filedialog.askopenfilename(filetypes=[("Imagens", "*.png *.tif *.tiff")])
 
         if not filename:
             return
 
         try:
-            path = Path(filename)
+            if not self.app_service.load_image(filename):
+                messagebox.showerror("Erro", f"Não foi possível abrir a imagem: {filename}")
+                return
 
-            sample = Sample(
-                path=path,
-                filename=path.name,
-                birads_class=SampleBiradsClass.D,
-                number=1,
-                set_type=SetType.TEST,
-                side=SampleSide.RIGHT,
-                view=SampleView.CC
-            )
-
-            self.current_sample = sample
-
-            self.current_image = ImageManager.load(sample)
-
-            config = SegmentationConfig(
-                threshold_offset=self.threshold_offset_var.get(),
-                closing_iterations=self.closing_iterations_var.get(),
-                kernel_size=self.kernel_size_var.get(),
-                crop=self.crop_var.get()
-            )
-
-            mask, segmented = SegmentationProcessor.segment(self.current_image, config)
-
-            image_pil = ImageManager.to_pil(self.current_image)
-
-            self.set_classification_image("original",image_pil)
-            self.set_classification_image("mask",ImageManager.to_pil(mask * 255))
-            self.set_classification_image("segmented",ImageManager.to_pil(segmented * 255))
-            self.set_classification_image("gradcam", None)
+            self._update_classification_preview()
 
             self.zoom_var.set(1.0)
-
             self.refresh_image()
+            self.update_classification_controls_state()
 
             LOGGER.info(f"Imagem aberta: {filename}")
 
@@ -1649,68 +2005,85 @@ class GUI(tk.Tk):
             LOGGER.error(f"Erro ao abrir imagem: {exc}")
             messagebox.showerror("Erro", str(exc))
 
-    def open_classification_image(self) -> None:
-        self.open_image()
-
     def refresh_image(self) -> None:
-        for name in ("original", "mask", "segmented", "gradcam"):
+        for name in self.CLASSIFICATION_PANELS:
             self.render_classification_panel(name)
 
-    def reset_zoom(self) -> None:
-        self.zoom_var.set(1.0)
-        self.refresh_image()
+    def _display_classification_result(self, result: ClassificationResult) -> str:
+        self.result_text.configure(state="normal")
+        self.result_text.delete("1.0", "end")
 
-    def set_classification_image(self, panel_name: str, image: Image.Image | None) -> None:
-        if image is None:
-            self.classification_images.pop(panel_name, None)
-            self.classification_tk_images.pop(panel_name, None)
+        if result.is_binary:
+            label = self.BINARY_RESULT_LABELS[result.prediction]
+            self.result_text.insert("end", f"Resultado binário: {label}\n")
+            self.result_text.insert("end", f"Confiança: {result.probabilities[result.prediction].item() * 100:.2f}%\n")
+            confidence_0 = result.probabilities[0].item() * 100
+            confidence_1 = result.probabilities[1].item() * 100
+            binary_confidences = (confidence_0, confidence_1)
+            for label_name, class_index in zip(self.BIRADS_LABELS, self.BINARY_BAR_CLASS_INDEX):
+                value = binary_confidences[class_index]
+                self.result_bars[label_name].config(value=value)
+                self.result_percent_labels[label_name].config(text=f"{value:.1f}%")
         else:
-            self.classification_images[panel_name] = image.convert("RGB")
-        self.render_classification_panel(panel_name)
+            label = result.class_labels[result.prediction]
+            self.result_text.insert("end", f"Resultado: {label}\n")
+            self.result_text.insert("end", "Probabilidades por classe:\n")
+            for index, class_name in enumerate(result.class_labels):
+                self.result_text.insert("end", f"  {class_name}: {result.probabilities[index].item() * 100:.2f}%\n")
+            for class_name, prob_value in zip(result.class_labels, result.probabilities.tolist()):
+                self.result_bars[class_name].config(value=prob_value * 100)
+                self.result_percent_labels[class_name].config(text=f"{prob_value * 100:.1f}%")
 
-    def render_classification_panel(self, panel_name: str) -> None:
-        canvas = self.image_canvases.get(panel_name)
-        if canvas is None:
-            return
-        canvas.delete("all")
-        width = max(canvas.winfo_width(), 1)
-        height = max(canvas.winfo_height(), 1)
-        image = self.classification_images.get(panel_name)
-        if image is None:
-            labels = {
-                "original": "Imagem original",
-                "mask": "Mascara",
-                "segmented": "Imagem segmentada",
-                "gradcam": "Grad-CAM",
-            }
-            canvas.create_text(width / 2, height / 2, text=labels.get(panel_name, panel_name), fill="#777777")
+        self.result_text.configure(state="disabled")
+        return label
+
+    def classify_current_image(self) -> None:
+        if self.app_service.get_current_image() is None:
+            messagebox.showinfo("Classificação", "Abra uma imagem para classificar.")
             return
 
-        zoom = float(self.zoom_var.get())
-        fit_scale = min(width / image.width, height / image.height)
-        scale = max(0.01, fit_scale * zoom)
-        display_width = max(1, int(image.width * scale))
-        display_height = max(1, int(image.height * scale))
-        resized = image.resize((display_width, display_height), Image.Resampling.NEAREST)
-        tk_image = ImageTk.PhotoImage(resized)
-        self.classification_tk_images[panel_name] = tk_image
-        canvas.create_image(width / 2, height / 2, image=tk_image, anchor="center")
+        if not self.app_service.training_manager:
+            messagebox.showinfo("Classificação", "Carregue um modelo ou treine um modelo primeiro.")
+            return
 
-    def ensure_records(self) -> bool:
-        if not self.dataset_manager.samples:
-            messagebox.showinfo("Dataset", "Selecione um dataset primeiro.")
-            return False
-        return True
-    
-    def _setup_logging_handler(self) -> None:
-        handler = TkinterLogHandler(self.log_message)
-
-        handler.setFormatter(
-            logging.Formatter(
-                "[%(levelname)s] %(message)s"
+        try:
+            result = self.app_service.classify_image(
+                self.app_service.get_current_image(),
+                task_type=self._get_classification_task_type(),
+                use_segmentation=self.classification_show_segmented_var.get(),
+                segmentation_config=self.get_segmentation_config()
             )
-        )
+            label = self._display_classification_result(result)
+            self.update_gradcam_panel()
+            LOGGER.info("Classificação concluída: %s", label)
+        except Exception as exc:
+            LOGGER.error("Erro ao classificar imagem: %s", exc)
+            messagebox.showerror("Erro", str(exc))
 
+    def _clear_logs(self) -> None:
+        self.log.delete("1.0", "end")
+
+    def _on_close(self) -> None:
+        if self.training_thread and self.training_thread.is_alive():
+            if not messagebox.askyesno("Sair", "Há um treinamento em andamento. Deseja encerrar mesmo assim?"):
+                return
+            self.app_service.cancel_training()
+
+        if self.app_service.training_manager is not None:
+            answer = messagebox.askyesnocancel("Sair", "Há um modelo em memória. Deseja salvar antes de sair?")
+            if answer is None:
+                return
+            if answer:
+                self.export_trained_model()
+
+        self.destroy()
+
+    def _setup_logging_handler(self) -> None:
+        def log_callback(msg: str) -> None:
+            self.log_message(msg)
+
+        handler = TkinterLogHandler(log_callback)
+        handler.setFormatter(logging.Formatter("%(asctime)s - [%(levelname)s] %(message)s"))
         LOGGER.addHandler(handler)
 
 # =============================================================
