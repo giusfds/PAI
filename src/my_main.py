@@ -97,9 +97,9 @@ class ModelType(StrEnum):
 
 @dataclass(slots=True)
 class SegmentationConfig:
-    threshold_offset: int = 0
-    closing_iterations: int = 3
-    kernel_size: int = 3
+    threshold_offset: int = -10
+    closing_iterations: int = 5
+    kernel_size: int = 20
     crop: bool = False
 
 @dataclass(slots=True)
@@ -114,9 +114,9 @@ class DatasetConfig:
 class TrainingConfig:
     model_type: ModelType = ModelType.RESNET18
     epochs: int = 8
-    batch_size: int = 16
+    batch_size: int = 32
     learning_rate: float = 0.001
-    dropout_rate: float = 0.3
+    dropout_rate: float = 0.5
     binary_classification: bool = True
     model_path: Path = Path("model.pth")
 
@@ -359,18 +359,18 @@ class SegmentationProcessor:
         return (labels == largest).astype(np.uint8)
     
     @staticmethod
-    def refine_mask(mask: np.ndarray, closing_iterations: int = 3, kernel_size: int = 3) -> np.ndarray:
+    def refine_mask(mask: np.ndarray, closing_iterations: int = 5, kernel_size: int = 20) -> np.ndarray:
         LOGGER.debug("Refinando máscara...")
 
         structure = np.ones((kernel_size, kernel_size), dtype=np.uint8)
 
-        mask = ndimage.binary_fill_holes(mask)
+        # mask = ndimage.binary_fill_holes(mask)
 
         mask = ndimage.binary_closing(mask, iterations=closing_iterations, structure=structure)
 
-        mask = ndimage.binary_opening(mask, iterations=1, structure=structure)
+        mask = ndimage.binary_opening(mask, iterations=5, structure=structure, )
 
-        smooth_mask = ndimage.gaussian_filter(mask.astype(np.float32), sigma=1.0)
+        smooth_mask = ndimage.gaussian_filter(mask.astype(np.float32), sigma=8.0)
 
         mask = (smooth_mask > 0.5).astype(np.uint8)
 
@@ -410,7 +410,8 @@ class SegmentationProcessor:
             kernel_size=config.kernel_size
         )
 
-        segmented = image * mask
+        segmented = image.copy()
+        segmented[mask == 0] = 0
 
         if config.crop:
             segmented = SegmentationProcessor.crop_to_bounding_box(segmented, mask)
@@ -1434,7 +1435,7 @@ class GUI(tk.Tk):
         row = self.add_control(panel, row, "Número de épocas", epochs_spin, pady_label=(8, 0))
         self.training_config_widgets.append(epochs_spin)
 
-        dropout_spin = ttk.Spinbox(panel, from_=0.0, to=0.9, increment=0.05, textvariable=self.dropout_var, width=8)
+        dropout_spin = ttk.Spinbox(panel, from_=0.0, to=10.0, increment=0.05, textvariable=self.dropout_var, width=8)
         row = self.add_control(panel, row, "Taxa de dropout", dropout_spin, pady_label=(8, 0))
         self.training_config_widgets.append(dropout_spin)
 
@@ -1451,15 +1452,15 @@ class GUI(tk.Tk):
         ttk.Label(panel, text="Configuração de segmentação").grid(row=row, column=0, sticky="w", pady=(8, 0))
         row += 1
 
-        threshold_spin = ttk.Spinbox(panel, from_=-50, to=50, textvariable=self.threshold_offset_var)
+        threshold_spin = ttk.Spinbox(panel, from_=-100, to=100, textvariable=self.threshold_offset_var)
         row = self.add_control(panel, row, "Ajuste do limiar", threshold_spin)
         self.training_segmentation_widgets.append(threshold_spin)
 
-        closing_spin = ttk.Spinbox(panel, from_=1, to=10, textvariable=self.closing_iterations_var)
+        closing_spin = ttk.Spinbox(panel, from_=1, to=100, textvariable=self.closing_iterations_var)
         row = self.add_control(panel, row, "Iterações de fechamento", closing_spin)
         self.training_segmentation_widgets.append(closing_spin)
 
-        kernel_spin = ttk.Spinbox(panel, from_=3, to=15, increment=2, textvariable=self.kernel_size_var)
+        kernel_spin = ttk.Spinbox(panel, from_=10, to=150, increment=1, textvariable=self.kernel_size_var)
         row = self.add_control(panel, row, "Tamanho do kernel", kernel_spin)
         self.training_segmentation_widgets.append(kernel_spin)
 
