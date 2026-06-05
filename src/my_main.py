@@ -9,18 +9,18 @@ import tkinter as tk
 import torch.nn as nn
 from pathlib import Path
 from scipy import ndimage
+from PIL import Image, ImageTk
 from enum import Enum, StrEnum
+from typing import Any, Callable
 from rich.logging import RichHandler
-from pytorch_grad_cam import GradCAM
-from PIL import Image, ImageOps, ImageTk
-from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable
-from torchvision import models, transforms
 from matplotlib.figure import Figure
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from pytorch_grad_cam import GradCAM
+from torchvision import models, transforms
 from tkinter import ttk, filedialog, messagebox
 from torch.utils.data import DataLoader, Dataset
+from dataclasses import asdict, dataclass, field
 from pytorch_grad_cam.utils.image import show_cam_on_image
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from sklearn.metrics import (
     accuracy_score,
     precision_score,
@@ -112,7 +112,6 @@ class DatasetConfig:
 
 @dataclass(slots=True)
 class TrainingConfig:
-    """Configuração de treino para o ciclo de treinamento do modelo."""
     model_type: ModelType = ModelType.RESNET18
     epochs: int = 8
     batch_size: int = 16
@@ -553,7 +552,9 @@ class MetricsCalculator:
 class TrainingManager:
     def __init__(
         self,
-        train_dataset: MammographyDataset,  test_dataset: MammographyDataset, config: TrainingConfig,
+        config: TrainingConfig,
+        train_dataset: MammographyDataset | None = None, 
+        test_dataset: MammographyDataset | None = None, 
         progress_callback: Callable[[int, int, float, float, float, float], None] | None = None,
         batch_progress_callback: Callable[[int, int, int, int], None] | None = None,
     ):
@@ -561,22 +562,26 @@ class TrainingManager:
         self.device = self._get_device()
         self.progress_callback = progress_callback
         self.batch_progress_callback = batch_progress_callback
+        self.train_loader: DataLoader | None = None
+        self.test_loader: DataLoader | None = None
 
-        self.train_loader = DataLoader(
-            train_dataset,
-            batch_size=config.batch_size,
-            shuffle=True,
-            pin_memory=torch.cuda.is_available(),
-            num_workers=2
-        )
+        if train_dataset is not None:
+            self.train_loader = DataLoader(
+                train_dataset,
+                batch_size=config.batch_size,
+                shuffle=True,
+                pin_memory=torch.cuda.is_available(),
+                num_workers=2
+            )
 
-        self.test_loader = DataLoader(
-            test_dataset,
-            batch_size=config.batch_size,
-            shuffle=False,
-            pin_memory=torch.cuda.is_available(),
-            num_workers=2
-        )
+        if test_dataset is not None:
+            self.test_loader = DataLoader(
+                test_dataset,
+                batch_size=config.batch_size,
+                shuffle=False,
+                pin_memory=torch.cuda.is_available(),
+                num_workers=2
+            )
 
         self.model = self._create_model()
         self.criterion = nn.CrossEntropyLoss()
@@ -646,8 +651,13 @@ class TrainingManager:
             raise ValueError(f"Modelo não suportado: {self.config.model_type}")
 
         return model.to(self.device)
+    
+    def _require_dataset(self) -> None:
+        if self.train_loader is None or self.test_loader is None:
+            raise RuntimeError("Esta operação requer datasets carregados.")
 
     def train_epoch(self, epoch: int, total_epochs: int) -> tuple[float, float]:
+        self._require_dataset()
         self.model.train()
 
         total_loss = 0.0
@@ -682,6 +692,7 @@ class TrainingManager:
         return total_loss / total, correct / total
 
     def validate(self) -> tuple[float, float]:
+        self._require_dataset()
         self.model.eval()
 
         total_loss = 0.0
@@ -710,6 +721,7 @@ class TrainingManager:
         return total_loss / total, correct / total
 
     def train(self) -> dict[str, list[float]]:
+        self._require_dataset()
         start_time = time.perf_counter()
 
         for epoch in range(1, self.config.epochs + 1):
@@ -752,12 +764,19 @@ class TrainingManager:
 
     def save_model(self, path: Path | None = None) -> None:
         path = path or self.config.model_path
-        torch.save(self.model.state_dict(), path)
+        checkpoint = {
+            "model_type": self.config.model_type.value,
+            "binary_classification": self.config.binary_classification,
+            "dropout_rate": self.config.dropout_rate,
+            "state_dict": self.model.state_dict()
+        }
+        torch.save(checkpoint, path)
         LOGGER.info("Modelo salvo em %s", path)
 
     def load_model(self, path: Path | None = None) -> None:
         path = path or self.config.model_path
-        self.model.load_state_dict(torch.load(path, map_location=self.device))
+        checkpoint = torch.load(path, map_location=self.device)
+        self.model.load_state_dict(checkpoint["state_dict"])
         self.model.eval()
         LOGGER.info("Modelo carregado de %s", path)
 
@@ -793,6 +812,16 @@ class TrainingManager:
             return MetricsCalculator.binary_metrics(y_true,y_pred)
 
         return MetricsCalculator.multiclass_metrics(y_true,y_pred)
+    
+    @staticmethod
+    def load_metadata(path: Path, device: torch.device) -> TrainingConfig:
+        checkpoint = torch.load(path, map_location=device)
+        return TrainingConfig(
+            model_type=ModelType(checkpoint["model_type"]),
+            binary_classification=checkpoint["binary_classification"],
+            dropout_rate=checkpoint["dropout_rate"],
+            model_path=path
+        )
 
 # =============================================================
 # GRAD-CAM
@@ -927,11 +956,11 @@ class ApplicationService:
         )
 
         self.training_manager = TrainingManager(
-            train_dataset,
-            test_dataset,
-            training_config,
+            train_dataset=train_dataset,
+            test_dataset=test_dataset,
+            config=training_config,
             progress_callback=progress_callback,
-            batch_progress_callback=batch_progress_callback,
+            batch_progress_callback=batch_progress_callback
         )
 
         return True
@@ -968,31 +997,9 @@ class ApplicationService:
             return False
 
     def load_model(self, path: Path) -> bool:
-        if not self.has_dataset():
-            LOGGER.error("Nenhum dataset carregado para usar com o modelo")
-            return False
+        training_config = TrainingManager.load_metadata(path, torch.device("cpu"))
 
-        dataset_config = DatasetConfig(
-            segmented=True,
-            augmentation=False,
-            binary_classification=True,
-            image_size=224,
-            segmentation_config=SegmentationConfig()
-        )
-
-        train_dataset = MammographyDataset(self.dataset_manager.train_samples, dataset_config)
-        test_dataset = MammographyDataset(self.dataset_manager.test_samples, dataset_config)
-
-        training_config = TrainingConfig(
-            model_type=ModelType.RESNET18,
-            epochs=1,
-            batch_size=16,
-            learning_rate=0.001,
-            binary_classification=True,
-            model_path=path
-        )
-
-        self.training_manager = TrainingManager(train_dataset, test_dataset, training_config)
+        self.training_manager = TrainingManager(config=training_config)
 
         try:
             self.training_manager.load_model(path)
@@ -2057,7 +2064,7 @@ class GUI(tk.Tk):
             self.update_gradcam_panel()
             LOGGER.info("Classificação concluída: %s", label)
         except Exception as exc:
-            LOGGER.error("Erro ao classificar imagem: %s", exc)
+            LOGGER.exception("Erro ao classificar imagem: %s", exc)
             messagebox.showerror("Erro", str(exc))
 
     def _clear_logs(self) -> None:
