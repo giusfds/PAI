@@ -8,6 +8,7 @@ import threading
 import numpy as np
 import tkinter as tk
 import torch.nn as nn
+import cv2
 from pathlib import Path
 from scipy import ndimage
 from PIL import Image, ImageTk
@@ -17,6 +18,7 @@ from rich.logging import RichHandler
 from matplotlib.figure import Figure
 from pytorch_grad_cam import GradCAM
 from torchvision import models, transforms
+from torchvision.transforms import functional as F
 from tkinter import ttk, filedialog, messagebox
 from torch.utils.data import DataLoader, Dataset
 from dataclasses import asdict, dataclass, field
@@ -361,20 +363,21 @@ class SegmentationProcessor:
     
     @staticmethod
     def refine_mask(mask: np.ndarray, closing_iterations: int = 5, kernel_size: int = 20) -> np.ndarray:
-        LOGGER.debug("Refinando máscara...")
-
-        structure = np.ones((kernel_size, kernel_size), dtype=np.uint8)
-
-        # mask = ndimage.binary_fill_holes(mask)
-
-        mask = ndimage.binary_closing(mask, iterations=closing_iterations, structure=structure)
-
-        mask = ndimage.binary_opening(mask, iterations=5, structure=structure, )
-
-        smooth_mask = ndimage.gaussian_filter(mask.astype(np.float32), sigma=8.0)
-
-        mask = (smooth_mask > 0.5).astype(np.uint8)
-
+        """
+        Refina máscara usando operações morfológicas do OpenCV (muito mais rápido que SciPy).
+        Remove gaussian_filter para ganho de performance.
+        """
+        LOGGER.debug("Refinando máscara com OpenCV...")
+        
+        # Criar kernel estruturante
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+        
+        # Fechamento morfológico (closing) - une regiões próximas
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=closing_iterations)
+        
+        # Abertura morfológica (opening) - remove ruído isolado
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=2)
+        
         return mask.astype(np.uint8)
 
     @staticmethod
@@ -396,31 +399,73 @@ class SegmentationProcessor:
 
     @staticmethod
     def segment(image: np.ndarray, config: SegmentationConfig = None) -> tuple[np.ndarray, np.ndarray]:
-        LOGGER.debug("Segmentando imagem...")
+        """
+        Segmenta imagem com otimizações:
+        - Downscale para acelerar processamento
+        - OpenCV morphologyEx em vez de SciPy
+        - Sem gaussian_filter
+        - Profiling de tempo para cada etapa
+        """
+        LOGGER.debug("Segmentando imagem com otimizações...")
 
         if config is None:
             config = SegmentationConfig()
-
-        mask = SegmentationProcessor.create_mask(image, threshold_offset=config.threshold_offset)
-
+        
+        # Profiling: medir cada etapa
+        timings = {}
+        
+        # Downscale para acelerar (~4-8x mais rápido com fator 0.5)
+        downscale_factor = 0.5
+        h, w = image.shape
+        new_h, new_w = int(h * downscale_factor), int(w * downscale_factor)
+        
+        start_time = time.perf_counter()
+        image_downscaled = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        timings['downscale'] = time.perf_counter() - start_time
+        
+        # Criar máscara em escala reduzida
+        start_time = time.perf_counter()
+        mask = SegmentationProcessor.create_mask(image_downscaled, threshold_offset=config.threshold_offset)
+        timings['threshold'] = time.perf_counter() - start_time
+        
+        # Extrair maior componente
+        start_time = time.perf_counter()
         mask = SegmentationProcessor.largest_component(mask)
-
+        timings['largest_component'] = time.perf_counter() - start_time
+        
+        # Refinar máscara (OpenCV - muito rápido)
+        start_time = time.perf_counter()
         mask = SegmentationProcessor.refine_mask(
             mask, 
             closing_iterations=config.closing_iterations, 
-            kernel_size=config.kernel_size
+            kernel_size=int(config.kernel_size * downscale_factor)
+        )
+        timings['refine'] = time.perf_counter() - start_time
+        
+        # Expandir máscara para resolução original
+        start_time = time.perf_counter()
+        mask_full = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
+        timings['upscale'] = time.perf_counter() - start_time
+        
+        # Aplicar máscara na imagem original
+        segmented = image.copy()
+        segmented[mask_full == 0] = 0
+        
+        # Log profiling
+        total_time = sum(timings.values())
+        LOGGER.info(
+            "Segmentação: downscale=%.1fms, threshold=%.1fms, component=%.1fms, refine=%.1fms, upscale=%.1fms | Total=%.1fms",
+            timings['downscale']*1000, timings['threshold']*1000, timings['largest_component']*1000,
+            timings['refine']*1000, timings['upscale']*1000, total_time*1000
         )
 
-        segmented = image.copy()
-        segmented[mask == 0] = 0
-
         if config.crop:
-            segmented = SegmentationProcessor.crop_to_bounding_box(segmented, mask)
-            mask = SegmentationProcessor.crop_to_bounding_box(mask, mask)
+            segmented = SegmentationProcessor.crop_to_bounding_box(segmented, mask_full)
+            mask_full = SegmentationProcessor.crop_to_bounding_box(mask_full, mask_full)
 
         LOGGER.debug("Segmentação concluída.")
 
-        return mask, segmented
+        return mask_full, segmented
     
 # =============================================================
 # AUMENTO DE DADOS
@@ -460,6 +505,7 @@ class MammographyDataset(Dataset):
         self.samples = samples
         self.config = config
         self.cache: dict[int, tuple[torch.Tensor, int]] = {}
+        self._segmentation_cache: dict[Path, np.ndarray] = {}
         self.transform = transforms.Compose([transforms.ToTensor()])
 
     def __len__(self):
@@ -475,38 +521,38 @@ class MammographyDataset(Dataset):
         if self.config.augmentation:
             sample_index = index // len(DataAugmentationProcessor.ROTATIONS)
             rotation_index = index % len(DataAugmentationProcessor.ROTATIONS)
-
             sample = self.samples[sample_index]
             angle = DataAugmentationProcessor.ROTATIONS[rotation_index]
         else:
             sample = self.samples[index]
             angle = 0
 
-        start = time.perf_counter()
+        # Carregar imagem bruta
         image = ImageManager.load(sample)
-        LOGGER.warning("LOAD %f", time.perf_counter() - start)
 
+        # Segmentação com cache por Sample (evita repetição)
         if self.config.segmented:
-            start = time.perf_counter()
-            _, image = SegmentationProcessor.segment(image, self.config.segmentation_config)
-            LOGGER.warning("SEGMENT %f", time.perf_counter() - start)
+            if sample.path not in self._segmentation_cache:
+                _, segmented = SegmentationProcessor.segment(image, self.config.segmentation_config)
+                self._segmentation_cache[sample.path] = segmented
+            image = self._segmentation_cache[sample.path]
 
-        if angle != 0:
-            start = time.perf_counter()
-            image = DataAugmentationProcessor.rotate(image, angle)
-            LOGGER.warning("ROTATE %f", time.perf_counter() - start)
-
+        # Preparar para tensor (sem logs de timing que custam CPU)
         image = ImageManager.resize(image, self.config.image_size, self.config.image_size)
         image = ImageManager.normalize(image)
         image = self._to_rgb(image)
-
+        
+        # Converter para tensor
         tensor_image = self.transform(image)
-        label = self._get_label(sample)
+        
+        # Aplicar rotação NO TENSOR (GPU-ready, muito mais rápido que ndimage)
+        if angle != 0:
+            tensor_image = self._rotate_tensor(tensor_image, angle)
 
+        label = self._get_label(sample)
         result = (tensor_image, torch.tensor(label, dtype=torch.long))
 
         self.cache[index] = result
-
         return result
 
     def _get_label(self, sample: Sample) -> int:
@@ -518,6 +564,54 @@ class MammographyDataset(Dataset):
         if len(image.shape) == 2:
             return np.stack([image] * 3, axis=-1)
         return image
+    
+    def _rotate_tensor(self, tensor: torch.Tensor, angle: float) -> torch.Tensor:
+        """
+        Rotaciona tensor de imagem MUITO mais rápido que ndimage.rotate.
+        Usa interpolação bilinear e é GPU-pronto.
+        """
+        # Adicionar batch dimension se necessário: (C, H, W) -> (1, C, H, W)
+        if tensor.dim() == 3:
+            tensor = tensor.unsqueeze(0)
+            squeeze = True
+        else:
+            squeeze = False
+        
+        # Usar torchvision affine (muito mais rápido que ndimage)
+        rotated = F.affine(
+            tensor,
+            angle=angle,
+            translate=[0, 0],
+            scale=1.0,
+            shear=[0, 0],
+            interpolation=transforms.InterpolationMode.BILINEAR,
+            fill=0
+        )
+        
+        if squeeze:
+            rotated = rotated.squeeze(0)
+        
+        return rotated
+    
+    def clear_index_cache(self) -> None:
+        """Limpa o cache por índice (mantém segmentações em memória)."""
+        self.cache.clear()
+    
+    def clear_segmentation_cache(self) -> None:
+        """Limpa o cache de segmentações (libera memória)."""
+        self._segmentation_cache.clear()
+    
+    def clear_all_caches(self) -> None:
+        """Limpa todos os caches."""
+        self.clear_index_cache()
+        self.clear_segmentation_cache()
+    
+    def get_cache_stats(self) -> dict[str, int]:
+        """Retorna estatísticas dos caches."""
+        return {
+            "index_cache_size": len(self.cache),
+            "segmentation_cache_size": len(self._segmentation_cache),
+        }
         
 # =============================================================
 # TREINAMENTO, CLASSIFICAÇÃO E AVALIAÇÃO
@@ -589,23 +683,31 @@ class TrainingManager:
         self.test_loader: DataLoader | None = None
 
         if train_dataset is not None:
+            # Reduzir num_workers para evitar overhead com dataset pequeno
+            # 2-4 workers é melhor para datasets < 5000 amostras
+            num_workers = max(1, min(4, (os.cpu_count() or 4) // 2))
             self.train_loader = DataLoader(
                 train_dataset,
                 batch_size=config.batch_size,
                 shuffle=True,
                 pin_memory=torch.cuda.is_available(),
-                num_workers=min(8, os.cpu_count()),
-                persistent_workers=True
+                num_workers=num_workers,
+                persistent_workers=(num_workers > 0),
+                prefetch_factor=3,
+                drop_last=True
             )
 
         if test_dataset is not None:
+            num_workers = max(1, min(4, (os.cpu_count() or 4) // 2))
             self.test_loader = DataLoader(
                 test_dataset,
                 batch_size=config.batch_size,
                 shuffle=False,
                 pin_memory=torch.cuda.is_available(),
-                num_workers=min(8, os.cpu_count()),
-                persistent_workers=True
+                num_workers=num_workers,
+                persistent_workers=(num_workers > 0),
+                prefetch_factor=3,
+                drop_last=False
             )
 
         self.model = self._create_model()
