@@ -100,9 +100,9 @@ class ModelType(StrEnum):
 
 @dataclass(slots=True)
 class SegmentationConfig:
-    threshold_offset: int = -10
-    closing_iterations: int = 5
-    kernel_size: int = 20
+    threshold_offset: int = 10
+    closing_iterations: int = 1
+    kernel_size: int = 25
     crop: bool = False
 
 @dataclass(slots=True)
@@ -119,7 +119,7 @@ class TrainingConfig:
     epochs: int = 8
     batch_size: int = 32
     learning_rate: float = 0.001
-    dropout_rate: float = 0.5
+    dropout_rate: float = 0.3
     binary_classification: bool = False
     model_path: Path = Path("model.pth")
 
@@ -1095,7 +1095,7 @@ class ApplicationService:
     def generate_gradcam(
         self,
         image: np.ndarray,
-        task_type: str,
+        # task_type: str,
         use_segmentation: bool,
         segmentation_config: SegmentationConfig | None = None
     ) -> GradCAMResult:
@@ -1550,13 +1550,16 @@ class GUI(tk.Tk):
 
         row = self.add_control_section(panel, row)
 
-        ttk.Label(panel, text="Tipo de classificação").grid(row=row, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(panel, text="Configuração do Modelo Importado").grid(row=row, column=0, sticky="w", pady=(8, 0))
+        row += 1
+
+        ttk.Label(panel, text="Tipo de classificação:").grid(row=row, column=0, sticky="w", pady=(8, 0))
         row += 1
         self.classification_task_display_label = ttk.Label(panel, text="-")
         self.classification_task_display_label.grid(row=row, column=0, sticky="w", pady=(0, 8))
         row += 1
 
-        ttk.Label(panel, text="Segmentação").grid(row=row, column=0, sticky="w")
+        ttk.Label(panel, text="Treinado com imagens segmentadas:").grid(row=row, column=0, sticky="w")
         row += 1
         self.classification_segmented_display_label = ttk.Label(panel, text="-")
         self.classification_segmented_display_label.grid(row=row, column=0, sticky="w", pady=(0, 8))
@@ -1624,8 +1627,8 @@ class GUI(tk.Tk):
 
         self.set_classification_image("gradcam", None)
 
-    def _get_classification_task_type(self) -> str:
-        return self.CLASSIFICATION_TASK_VALUE_MAP.get(self.classification_task_var.get(), "binary")
+    # def _get_classification_task_type(self) -> str:
+    #     return self.CLASSIFICATION_TASK_VALUE_MAP.get(self.classification_task_var.get(), "binary")
 
     def set_classification_image(self, key: str, image: Image.Image | None) -> None:
         self.classification_images[key] = image
@@ -2023,7 +2026,7 @@ class GUI(tk.Tk):
             
             gradcam_result = self.app_service.generate_gradcam(
                 image,
-                task_type=self._get_classification_task_type(),
+                # task_type=self._get_classification_task_type(),
                 use_segmentation=self.classification_show_segmented_var.get(),
                 segmentation_config=self.get_segmentation_config()
             )
@@ -2113,7 +2116,7 @@ class GUI(tk.Tk):
         try:
             result = self.app_service.classify_image(
                 self.app_service.get_current_image(),
-                task_type=self._get_classification_task_type(),
+                # task_type=self._get_classification_task_type(),
                 use_segmentation=self.classification_show_segmented_var.get(),
                 segmentation_config=self.get_segmentation_config()
             )
