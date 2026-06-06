@@ -1075,7 +1075,7 @@ class ApplicationService:
         
         return tensor, processed_rgb
 
-    def classify_image(self, image: np.ndarray, task_type: str, use_segmentation: bool, segmentation_config: SegmentationConfig | None = None) -> ClassificationResult:
+    def classify_image(self, image: np.ndarray, use_segmentation: bool, segmentation_config: SegmentationConfig | None = None) -> ClassificationResult:
         if not self.training_manager:
             raise RuntimeError("Nenhum modelo carregado para classificação")
 
@@ -1089,7 +1089,7 @@ class ApplicationService:
             prediction=prediction,
             probabilities=probabilities,
             class_labels=class_labels,
-            is_binary=task_type == "binary"
+            is_binary=self.training_manager.config.binary_classification
         )
 
     def generate_gradcam(
@@ -1581,7 +1581,9 @@ class GUI(tk.Tk):
 
         if self.classification_model_status_label is not None:
             self.classification_model_status_label.config(
-                text="Modelo: em memória" if has_model else "Modelo: não carregado (importe para classificar)"
+                text="Modelo: " + self.app_service.training_manager.config.model_type 
+                if has_model 
+                else "Modelo: não carregado (importe para classificar)"
             )
 
         if hasattr(self, "classification_import_button"):
