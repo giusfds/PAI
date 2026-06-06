@@ -120,7 +120,7 @@ class TrainingConfig:
     batch_size: int = 32
     learning_rate: float = 0.001
     dropout_rate: float = 0.5
-    binary_classification: bool = True
+    binary_classification: bool = False
     model_path: Path = Path("model.pth")
 
 _DEFAULT_TRAINING_CONFIG = TrainingConfig()
@@ -291,57 +291,15 @@ class ImageManager:
 # =============================================================
 
 class SegmentationProcessor:
-    @staticmethod
-    def otsu_threshold(image: np.ndarray) -> int:
-        LOGGER.debug("Calculando threshold de Otsu...")
-
-        hist, _ = np.histogram(image.ravel(), bins=256, range=(0, 256))
-
-        total = image.size
-
-        sum_total = np.dot(np.arange(256), hist)
-
-        sum_background = 0
-        weight_background = 0
-
-        max_variance = 0
-        threshold = 0
-
-        for t in range(256):
-            weight_background += hist[t]
-
-            if weight_background == 0:
-                continue
-
-            weight_foreground = total - weight_background
-
-            if weight_foreground == 0:
-                break
-
-            sum_background += t * hist[t]
-
-            mean_background = sum_background / weight_background
-
-            mean_foreground = (sum_total - sum_background) / weight_foreground
-
-            variance = (weight_background* weight_foreground* (mean_background - mean_foreground) ** 2)
-
-            if variance > max_variance:
-                max_variance = variance
-                threshold = t
-
-        LOGGER.debug("Threshold de Otsu calculado: %d", threshold)
-
-        return threshold
+    DOWNSCALE_FACTOR = 0.5
 
     @staticmethod
     def create_mask(image: np.ndarray, threshold_offset: int = 0) -> np.ndarray:
         LOGGER.debug("Criando máscara de segmentação...")
 
-        threshold = SegmentationProcessor.otsu_threshold(image)
+        threshold, _ = cv2.threshold(image, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-        threshold += threshold_offset
-
+        threshold = int(threshold) + threshold_offset
         threshold = max(0, min(255, threshold))
 
         return (image > threshold).astype(np.uint8)
@@ -350,122 +308,82 @@ class SegmentationProcessor:
     def largest_component(mask: np.ndarray) -> np.ndarray:
         LOGGER.debug("Extraindo maior componente conectada...")
 
-        labels, num_labels = ndimage.label(mask)
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
 
-        if num_labels == 0:
+        if num_labels <= 1:
             return mask
 
-        sizes = ndimage.sum(mask, labels, range(1, num_labels + 1))
+        largest_label = (np.argmax(stats[1:, cv2.CC_STAT_AREA]) + 1)
 
-        largest = np.argmax(sizes) + 1
+        return (labels == largest_label).astype(np.uint8)
 
-        return (labels == largest).astype(np.uint8)
-    
     @staticmethod
-    def refine_mask(mask: np.ndarray, closing_iterations: int = 5, kernel_size: int = 20) -> np.ndarray:
-        """
-        Refina máscara usando operações morfológicas do OpenCV (muito mais rápido que SciPy).
-        Remove gaussian_filter para ganho de performance.
-        """
-        LOGGER.debug("Refinando máscara com OpenCV...")
-        
-        # Criar kernel estruturante
+    def refine_mask(mask: np.ndarray, closing_iterations: int = 5, kernel_size: int = 15) -> np.ndarray:
+        LOGGER.debug("Refinando máscara...")
+
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
-        
-        # Fechamento morfológico (closing) - une regiões próximas
+
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=closing_iterations)
-        
-        # Abertura morfológica (opening) - remove ruído isolado
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=2)
-        
+
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+
         return mask.astype(np.uint8)
 
     @staticmethod
     def crop_to_bounding_box(image: np.ndarray, mask: np.ndarray) -> np.ndarray:
-        LOGGER.debug("Cortando imagem para bounding box da máscara...")
+        LOGGER.debug("Aplicando crop...")
 
-        rows, cols = np.where(mask > 0)
+        points = cv2.findNonZero(mask)
 
-        if len(rows) == 0:
+        if points is None:
             return image
 
-        top = rows.min()
-        bottom = rows.max()
+        x, y, w, h = cv2.boundingRect(points)
 
-        left = cols.min()
-        right = cols.max()
-
-        return image[top:bottom + 1, left:right + 1]
+        return image[y:y + h, x:x + w]
 
     @staticmethod
-    def segment(image: np.ndarray, config: SegmentationConfig = None) -> tuple[np.ndarray, np.ndarray]:
-        """
-        Segmenta imagem com otimizações:
-        - Downscale para acelerar processamento
-        - OpenCV morphologyEx em vez de SciPy
-        - Sem gaussian_filter
-        - Profiling de tempo para cada etapa
-        """
-        LOGGER.debug("Segmentando imagem com otimizações...")
-
+    def segment(image: np.ndarray, config: SegmentationConfig | None = None) -> tuple[np.ndarray, np.ndarray]:
         if config is None:
             config = SegmentationConfig()
-        
-        # Profiling: medir cada etapa
-        timings = {}
-        
-        # Downscale para acelerar (~4-8x mais rápido com fator 0.5)
-        downscale_factor = 0.5
-        h, w = image.shape
-        new_h, new_w = int(h * downscale_factor), int(w * downscale_factor)
-        
-        start_time = time.perf_counter()
-        image_downscaled = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
-        timings['downscale'] = time.perf_counter() - start_time
-        
-        # Criar máscara em escala reduzida
-        start_time = time.perf_counter()
-        mask = SegmentationProcessor.create_mask(image_downscaled, threshold_offset=config.threshold_offset)
-        timings['threshold'] = time.perf_counter() - start_time
-        
-        # Extrair maior componente
-        start_time = time.perf_counter()
+
+        start_total = time.perf_counter()
+
+        original_height, original_width = image.shape
+
+        factor = SegmentationProcessor.DOWNSCALE_FACTOR
+
+        if factor < 1.0:
+            reduced = cv2.resize(image,
+                (int(original_width * factor), int(original_height * factor)), interpolation=cv2.INTER_AREA)
+        else:
+            reduced = image
+
+        mask = SegmentationProcessor.create_mask(reduced, threshold_offset=config.threshold_offset)
         mask = SegmentationProcessor.largest_component(mask)
-        timings['largest_component'] = time.perf_counter() - start_time
-        
-        # Refinar máscara (OpenCV - muito rápido)
-        start_time = time.perf_counter()
-        mask = SegmentationProcessor.refine_mask(
-            mask, 
-            closing_iterations=config.closing_iterations, 
-            kernel_size=int(config.kernel_size * downscale_factor)
-        )
-        timings['refine'] = time.perf_counter() - start_time
-        
-        # Expandir máscara para resolução original
-        start_time = time.perf_counter()
-        mask_full = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
-        timings['upscale'] = time.perf_counter() - start_time
-        
-        # Aplicar máscara na imagem original
+
+        kernel_size = max(3, int(config.kernel_size * factor))
+
+        if kernel_size % 2 == 0:
+            kernel_size += 1
+
+        mask = SegmentationProcessor.refine_mask(mask, closing_iterations=config.closing_iterations, kernel_size=kernel_size)
+
+        if factor < 1.0:
+            mask = cv2.resize(mask, (original_width, original_height), interpolation=cv2.INTER_NEAREST)
+
         segmented = image.copy()
-        segmented[mask_full == 0] = 0
-        
-        # Log profiling
-        total_time = sum(timings.values())
-        LOGGER.info(
-            "Segmentação: downscale=%.1fms, threshold=%.1fms, component=%.1fms, refine=%.1fms, upscale=%.1fms | Total=%.1fms",
-            timings['downscale']*1000, timings['threshold']*1000, timings['largest_component']*1000,
-            timings['refine']*1000, timings['upscale']*1000, total_time*1000
-        )
+        segmented[mask == 0] = 0
 
         if config.crop:
-            segmented = SegmentationProcessor.crop_to_bounding_box(segmented, mask_full)
-            mask_full = SegmentationProcessor.crop_to_bounding_box(mask_full, mask_full)
+            segmented = SegmentationProcessor.crop_to_bounding_box(segmented, mask)
+            mask = SegmentationProcessor.crop_to_bounding_box(mask, mask)
 
-        LOGGER.debug("Segmentação concluída.")
+        elapsed = time.perf_counter() - start_total
 
-        return mask_full, segmented
+        LOGGER.debug("Segmentação concluída em %.3fs", elapsed)
+
+        return mask, segmented
     
 # =============================================================
 # AUMENTO DE DADOS
@@ -527,25 +445,20 @@ class MammographyDataset(Dataset):
             sample = self.samples[index]
             angle = 0
 
-        # Carregar imagem bruta
         image = ImageManager.load(sample)
 
-        # Segmentação com cache por Sample (evita repetição)
         if self.config.segmented:
             if sample.path not in self._segmentation_cache:
                 _, segmented = SegmentationProcessor.segment(image, self.config.segmentation_config)
                 self._segmentation_cache[sample.path] = segmented
             image = self._segmentation_cache[sample.path]
 
-        # Preparar para tensor (sem logs de timing que custam CPU)
         image = ImageManager.resize(image, self.config.image_size, self.config.image_size)
         image = ImageManager.normalize(image)
         image = self._to_rgb(image)
         
-        # Converter para tensor
         tensor_image = self.transform(image)
         
-        # Aplicar rotação NO TENSOR (GPU-ready, muito mais rápido que ndimage)
         if angle != 0:
             tensor_image = self._rotate_tensor(tensor_image, angle)
 
@@ -566,18 +479,12 @@ class MammographyDataset(Dataset):
         return image
     
     def _rotate_tensor(self, tensor: torch.Tensor, angle: float) -> torch.Tensor:
-        """
-        Rotaciona tensor de imagem MUITO mais rápido que ndimage.rotate.
-        Usa interpolação bilinear e é GPU-pronto.
-        """
-        # Adicionar batch dimension se necessário: (C, H, W) -> (1, C, H, W)
         if tensor.dim() == 3:
             tensor = tensor.unsqueeze(0)
             squeeze = True
         else:
             squeeze = False
         
-        # Usar torchvision affine (muito mais rápido que ndimage)
         rotated = F.affine(
             tensor,
             angle=angle,
@@ -592,26 +499,6 @@ class MammographyDataset(Dataset):
             rotated = rotated.squeeze(0)
         
         return rotated
-    
-    def clear_index_cache(self) -> None:
-        """Limpa o cache por índice (mantém segmentações em memória)."""
-        self.cache.clear()
-    
-    def clear_segmentation_cache(self) -> None:
-        """Limpa o cache de segmentações (libera memória)."""
-        self._segmentation_cache.clear()
-    
-    def clear_all_caches(self) -> None:
-        """Limpa todos os caches."""
-        self.clear_index_cache()
-        self.clear_segmentation_cache()
-    
-    def get_cache_stats(self) -> dict[str, int]:
-        """Retorna estatísticas dos caches."""
-        return {
-            "index_cache_size": len(self.cache),
-            "segmentation_cache_size": len(self._segmentation_cache),
-        }
         
 # =============================================================
 # TREINAMENTO, CLASSIFICAÇÃO E AVALIAÇÃO
@@ -683,8 +570,6 @@ class TrainingManager:
         self.test_loader: DataLoader | None = None
 
         if train_dataset is not None:
-            # Reduzir num_workers para evitar overhead com dataset pequeno
-            # 2-4 workers é melhor para datasets < 5000 amostras
             num_workers = max(1, min(4, (os.cpu_count() or 4) // 2))
             self.train_loader = DataLoader(
                 train_dataset,
