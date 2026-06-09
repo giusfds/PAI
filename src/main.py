@@ -1095,7 +1095,6 @@ class ApplicationService:
     def generate_gradcam(
         self,
         image: np.ndarray,
-        # task_type: str,
         use_segmentation: bool,
         segmentation_config: SegmentationConfig | None = None
     ) -> GradCAMResult:
@@ -1627,9 +1626,6 @@ class GUI(tk.Tk):
 
         self.set_classification_image("gradcam", None)
 
-    # def _get_classification_task_type(self) -> str:
-    #     return self.CLASSIFICATION_TASK_VALUE_MAP.get(self.classification_task_var.get(), "binary")
-
     def set_classification_image(self, key: str, image: Image.Image | None) -> None:
         self.classification_images[key] = image
         self.render_classification_panel(key)
@@ -2026,7 +2022,6 @@ class GUI(tk.Tk):
             
             gradcam_result = self.app_service.generate_gradcam(
                 image,
-                # task_type=self._get_classification_task_type(),
                 use_segmentation=self.classification_show_segmented_var.get(),
                 segmentation_config=self.get_segmentation_config()
             )
@@ -2116,7 +2111,6 @@ class GUI(tk.Tk):
         try:
             result = self.app_service.classify_image(
                 self.app_service.get_current_image(),
-                # task_type=self._get_classification_task_type(),
                 use_segmentation=self.classification_show_segmented_var.get(),
                 segmentation_config=self.get_segmentation_config()
             )
