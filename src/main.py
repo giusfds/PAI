@@ -1,3 +1,7 @@
+# Caio Diniz        - 793605 - Ciência da Computação - Coreu
+# Giuseppe Cordeiro - 801779 - Ciência da Computação - Coreu
+# Vinícius Miranda  - 812839 - Ciência da Computação - Coreu
+
 import os
 import re
 import queue
@@ -33,10 +37,6 @@ from sklearn.metrics import (
     ConfusionMatrixDisplay,
     classification_report,
 )
-
-# =============================================================
-# ENUMS, CLASSES, CONFIGS e LOG
-# =============================================================
 
 _rich_handler = RichHandler(
     show_time=True,
@@ -126,9 +126,6 @@ class TrainingConfig:
 _DEFAULT_TRAINING_CONFIG = TrainingConfig()
 _DEFAULT_SEGMENTATION_CONFIG = SegmentationConfig()
 
-# =============================================================
-# DATASET MANAGER
-# =============================================================
 
 class DatasetManager:
     IMAGE_EXTENSIONS: set[str] = {".png", ".tif", ".tiff"}
@@ -231,9 +228,6 @@ class DatasetManager:
         
         raise ValueError(f"View não encontrada no filename: {filename}")
 
-# =============================================================
-# IMAGE MANAGER
-# =============================================================
 
 class ImageManager:
     @staticmethod
@@ -285,10 +279,6 @@ class ImageManager:
         image = (image * 255).astype(np.uint8)
 
         return Image.fromarray(image)
-
-# =============================================================
-# SEGMENTATION PROCESSOR
-# =============================================================
 
 class SegmentationProcessor:
     DOWNSCALE_FACTOR = 0.5
@@ -384,10 +374,6 @@ class SegmentationProcessor:
         LOGGER.debug("Segmentação concluída em %.3fs", elapsed)
 
         return mask, segmented
-    
-# =============================================================
-# AUMENTO DE DADOS
-# =============================================================
 
 class DataAugmentationProcessor:
     ROTATIONS = [-20, -10, 0, 10, 20]
@@ -399,10 +385,6 @@ class DataAugmentationProcessor:
         rotated = ndimage.rotate(image, angle=angle, reshape=False, mode="constant", cval=0)
 
         return rotated.astype(image.dtype)
-
-# =============================================================
-# TRANSFORMAÇÃO
-# =============================================================
 
 class MammographyDataset(Dataset):
     BINARY_CLASS_MAPPING = {
@@ -500,9 +482,6 @@ class MammographyDataset(Dataset):
         
         return rotated
         
-# =============================================================
-# TREINAMENTO, CLASSIFICAÇÃO E AVALIAÇÃO
-# =============================================================
 
 class MetricsCalculator:
     @staticmethod
@@ -837,9 +816,6 @@ class TrainingManager:
             model_path=path
         )
 
-# =============================================================
-# GRAD-CAM
-# =============================================================
 
 class GradCAMProcessor:
     def __init__(self, model: nn.Module):
@@ -874,9 +850,7 @@ class GradCAMProcessor:
         visualization = show_cam_on_image(image, heatmap, use_rgb=True)
         return visualization
 
-# =============================================================
-# SERVICE CENTRALIZADO
-# =============================================================
+
 
 @dataclass
 class ClassificationResult:
@@ -1121,9 +1095,7 @@ class ApplicationService:
             LOGGER.error("Erro ao gerar Grad-CAM: %s", e, exc_info=True)
             return GradCAMResult(visualization=None, error=str(e))
 
-# =============================================================
-# INTERFACE GRÁFICA
-# =============================================================
+
 
 class TkinterLogHandler(logging.Handler):
     def __init__(self, callback):
@@ -2147,9 +2119,6 @@ class GUI(tk.Tk):
         handler.setFormatter(logging.Formatter("%(asctime)s - [%(levelname)s] %(message)s"))
         LOGGER.addHandler(handler)
 
-# =============================================================
-# MAIN
-# =============================================================
 
 def main():
     app = GUI()
